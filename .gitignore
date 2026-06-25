@@ -1,0 +1,12 @@
+.venv/
+.venv-1/
+.DS_Store
+_work/
+credentials.json
+token.json
+slack_report_webhook.txt
+slack_alert_webhook.txt
+processed.json
+history.json
+__pycache__/
+logs/
