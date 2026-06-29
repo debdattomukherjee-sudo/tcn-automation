@@ -455,6 +455,7 @@ def analyze_ob(ob):
         res["cost_wasted"] = float(tc.sum()) - cost_on_al
         res["cost_per_connect_est"] = cost_per_connect_by_bucket(
             res["cost_by_est"], res["est_al"])
+    res["_df"] = ob          # kept for the live-formula raw-data sheet
     return res
 
 
@@ -573,6 +574,7 @@ def analyze_ib(ib):
         res["total_talk"] = float(td.sum()) if len(td) else 0.0
     # agent + disposition layer (Col K/L + "An Agent Call Response")
     res["agentdisp"] = analyze_ib_agents(ib, m)
+    res["_df"] = ib          # kept for the live-formula raw-data sheet
     return res
 
 
@@ -649,6 +651,135 @@ def recommendations(period, ob_res, ib_res):
     if not recs:
         recs.append("Not enough volume in this period to make confident recommendations.")
     return recs
+
+
+# --------------------------------------------------------------------------- #
+# Live-formula raw-data layer                                                  #
+# --------------------------------------------------------------------------- #
+# Every analytical number in the report is written as a VISIBLE Excel formula
+# (COUNTIF / COUNTIFS / SUMIFS / AVERAGEIFS / cell-ratios) that points at a copy
+# of the raw dump embedded as a sheet (OB_RawData / IB_RawData). Leadership can
+# click any cell and see exactly how the value is derived. We still compute the
+# same numbers in pandas (for the trend history + alerts + row ordering/labels);
+# only the cell VALUES become formulas so Excel recomputes them live.
+
+# Helper columns we add to the raw sheet so the formulas stay simple + readable.
+H_WEEKDAY = "Weekday"
+H_WEEKBLOCK = "Week Block"
+H_ISCONNECT = "Is Connect"          # Yes/No  (OB: Answered Linkcall; IB: connected results)
+H_AGENT = "Agent Name"
+H_DISP_CODE = "Disp Code"
+H_HASDISP = "Has Disp"              # Yes/No
+H_DISP_CLASS = "Disp Class"
+H_DISP_PARTY = "Disp Party"
+H_DISP_OUTCOME = "Disp Outcome"
+H_DISP_CONN = "Disp Connected"     # Yes/No/""
+
+
+def _prep_raw(df, meta, stream):
+    """Return a copy of the raw frame with derived helper columns appended and
+    the internal datetime column dropped, ready to dump as the *_RawData sheet."""
+    d = df.copy()
+    dt = d["_est_dt"]
+    d[H_WEEKDAY] = dt.apply(lambda x: x.strftime("%A") if x is not None else None)
+    d[H_WEEKBLOCK] = dt.apply(lambda x: week_block(x.day) if x is not None else None)
+    res = d[meta["result"]]
+    conn = (res == OB_ANSWERED_LINKCALL) if stream == "OB" else res.isin(IB_CONNECTED_RESULTS)
+    d[H_ISCONNECT] = ["Yes" if b else "No" for b in conn]
+    if stream == "IB" and meta.get("disposition"):
+        parsed = d[meta["disposition"]].apply(parse_disposition)
+        an = agent_name_series(d, meta)
+        d[H_AGENT] = an if an is not None else AGENT_BLANK_LABEL
+        d[H_DISP_CODE] = parsed.apply(lambda p: p["raw"])
+        d[H_HASDISP] = parsed.apply(lambda p: "Yes" if p["raw"] is not None else "No")
+        d[H_DISP_CLASS] = parsed.apply(lambda p: p["class"])
+        d[H_DISP_PARTY] = parsed.apply(lambda p: p["party"])
+        d[H_DISP_OUTCOME] = parsed.apply(lambda p: p["outcome"])
+        d[H_DISP_CONN] = parsed.apply(
+            lambda p: "Yes" if p["connected"] else ("No" if p["connected"] is False else ""))
+    return d.drop(columns=["_est_dt"], errors="ignore")
+
+
+def _q(v):
+    """Quote a value as an Excel text criterion (exact match)."""
+    return '"' + str(v).replace('"', '""') + '"'
+
+
+class RawRef:
+    """Addresses columns of an embedded raw sheet by header name and builds the
+    aggregate-formula expressions (no leading '='; use EQ() to drop in a cell)."""
+
+    def __init__(self, title, headers, nrows):
+        self.title = title
+        self.nrows = nrows
+        self._col = {h: get_column_letter(i + 1) for i, h in enumerate(headers)}
+
+    def has(self, header):
+        return header in self._col
+
+    def rng(self, header):
+        L = self._col[header]
+        return f"'{self.title}'!${L}$2:${L}${self.nrows + 1}"
+
+    def counta(self, header):
+        return f"COUNTA({self.rng(header)})"
+
+    def countif(self, header, crit):
+        return f"COUNTIF({self.rng(header)},{crit})"
+
+    def countifs(self, pairs):
+        parts = []
+        for h, c in pairs:
+            parts += [self.rng(h), c]
+        return "COUNTIFS(" + ",".join(parts) + ")"
+
+    def sum(self, header):
+        return f"SUM({self.rng(header)})"
+
+    def sumif(self, crit_header, crit, sum_header):
+        return f"SUMIF({self.rng(crit_header)},{crit},{self.rng(sum_header)})"
+
+    def sumifs(self, sum_header, pairs):
+        parts = [self.rng(sum_header)]
+        for h, c in pairs:
+            parts += [self.rng(h), c]
+        return "SUMIFS(" + ",".join(parts) + ")"
+
+    def averageifs(self, avg_header, pairs):
+        parts = [self.rng(avg_header)]
+        for h, c in pairs:
+            parts += [self.rng(h), c]
+        return "AVERAGEIFS(" + ",".join(parts) + ")"
+
+
+def EQ(expr):
+    return "=" + expr
+
+
+def IFERR(expr, alt='"-"'):
+    return f"IFERROR({expr},{alt})"
+
+
+def write_raw_sheet(wb, title, df_out):
+    """Dump the prepared raw frame to a sheet; return a RawRef for it."""
+    ws = wb.create_sheet(title)
+    headers = list(df_out.columns)
+    for j, h in enumerate(headers, start=1):
+        c = ws.cell(1, j, str(h))
+        c.font = f(9, True, "FFFFFF"); c.fill = fill(BLUE); c.border = BORDER
+    for i, (_, row) in enumerate(df_out.iterrows(), start=2):
+        for j, h in enumerate(headers, start=1):
+            v = row[h]
+            if v is None or (isinstance(v, float) and pd.isna(v)) or (
+                    isinstance(v, type(pd.NaT)) and pd.isna(v)):
+                v = None
+            elif isinstance(v, float) and v != v:  # NaN guard
+                v = None
+            ws.cell(i, j, v)
+    ws.freeze_panes = "A2"
+    for j in range(1, len(headers) + 1):
+        ws.column_dimensions[get_column_letter(j)].width = 15
+    return RawRef(title, headers, len(df_out))
 
 
 # --------------------------------------------------------------------------- #
@@ -774,105 +905,165 @@ def best_bucket(series):
     return (b, int(series.max()), pct(series.max(), tot))
 
 
-def write_distribution_table(sh, title, series, value_label):
-    tot = int(series.sum()) if len(series) else 0
+def _count_pct_table(sh, headers, label_count_exprs, widths, *, total_label="Total"):
+    """Write a 3-col 'label | count | % of total' table where count cells are
+    live COUNTIF/COUNTIFS formulas and the % + Total cells are live cell-ratio /
+    SUM formulas. label_count_exprs = [(label, count_expr_without_eq), ...]."""
+    data_start = sh.r + 1
+    total_row = data_start + len(label_count_exprs)
     rows = []
-    for b in [x for x in BUCKET_ORDER if x in series.index]:
-        n = int(series[b])
-        rows.append([b, n, pct(n, tot)])
-    rows.append(["Total", tot, 1.0 if tot else 0.0])
-    sh.section(title)
-    sh.table([value_label and "Time Bucket" or "Time Bucket", value_label, "% Distribution"],
-             rows, pct_cols=(3,), num_cols=(2,), widths=[18, 16, 16], total_row=True)
+    for i, (label, cexpr) in enumerate(label_count_exprs):
+        er = data_start + i
+        rows.append([label, EQ(cexpr), EQ(IFERR(f"B{er}/B${total_row}", "0"))])
+    rows.append([total_label, EQ(f"SUM(B{data_start}:B{total_row - 1})"),
+                 EQ(IFERR(f"B{total_row}/B${total_row}", "0"))])
+    sh.table(list(headers), rows, pct_cols=(3,), num_cols=(2,),
+             widths=list(widths), total_row=True)
 
 
-def write_outcome_matrix(sh, title, ct):
-    cols = list(ct.columns)
-    headers = ["Time Bucket"] + cols
-    rows = []
-    for b in ct.index:
-        rows.append([b] + [int(ct.loc[b, c]) for c in cols])
-    # total row
-    rows.append(["Total"] + [int(ct[c].sum()) for c in cols])
+def write_distribution_table(sh, title, raw, bucket_header, present_buckets, value_label):
+    """Missed-by-window distribution: count = COUNTIFS(bucket, Is Connect=No)."""
     sh.section(title)
-    widths = [18] + [max(10, len(str(c)) * 0.95) for c in cols]
+    if not present_buckets:
+        sh.table(["Time Bucket", value_label, "% Distribution"],
+                 [["(no data)", 0, 0.0]], pct_cols=(3,), num_cols=(2,),
+                 widths=[18, 16, 16])
+        return
+    exprs = [(b, raw.countifs([(bucket_header, _q(b)), (H_ISCONNECT, _q("No"))]))
+             for b in present_buckets]
+    _count_pct_table(sh, ["Time Bucket", value_label, "% Distribution"],
+                     exprs, (18, 16, 16))
+
+
+def write_outcome_matrix(sh, title, raw, bucket_header, result_header, ct):
+    cols = [c for c in ct.columns if c != "Total"]
+    ncols = len(cols)
+    headers = ["Time Bucket"] + cols + ["Total"]
+    last_res = get_column_letter(1 + ncols)        # results occupy cols 2..1+ncols
+    buckets = list(ct.index)
+    sh.section(title)
+    data_start = sh.r + 1   # first data row (after section + table header)
+    total_row = data_start + len(buckets)
+    rows = []
+    for i, b in enumerate(buckets):
+        er = data_start + i
+        rowvals = [b]
+        for c in cols:
+            rowvals.append(EQ(raw.countifs([(bucket_header, _q(b)), (result_header, _q(c))])))
+        rowvals.append(EQ(f"SUM(B{er}:{last_res}{er})"))
+        rows.append(rowvals)
+    trow = ["Total"]
+    for k in range(ncols):
+        colL = get_column_letter(2 + k)
+        trow.append(EQ(f"SUM({colL}{data_start}:{colL}{total_row - 1})"))
+    trow.append(EQ(f"SUM(B{total_row}:{last_res}{total_row})"))
+    rows.append(trow)
+    widths = [18] + [max(10, len(str(c)) * 0.95) for c in cols] + [10]
     sh.table(headers, rows, num_cols=tuple(range(2, len(headers) + 1)),
              widths=widths, total_row=True)
 
 
-def write_outcome_matrix_pct(sh, title, ct):
-    """Within-bucket % of each outcome (excludes the Total column)."""
+def write_outcome_matrix_pct(sh, title, raw, bucket_header, result_header, ct):
+    """Within-bucket % of each outcome: COUNTIFS / per-bucket Calls cell."""
     cols = [c for c in ct.columns if c != "Total"]
+    ncols = len(cols)
+    calls_col = get_column_letter(2 + ncols)        # the 'Calls' column
     headers = ["Time Bucket"] + cols + ["Calls"]
-    rows = []
-    for b in ct.index:
-        tot = ct.loc[b, "Total"]
-        rows.append([b] + [pct(ct.loc[b, c], tot) for c in cols] + [int(tot)])
+    buckets = list(ct.index)
     sh.section(title)
+    data_start = sh.r + 1   # first data row (after section + table header)
+    rows = []
+    for i, b in enumerate(buckets):
+        er = data_start + i
+        rowvals = [b]
+        for c in cols:
+            num = raw.countifs([(bucket_header, _q(b)), (result_header, _q(c))])
+            rowvals.append(EQ(IFERR(f"{num}/{calls_col}{er}", "0")))
+        rowvals.append(EQ(raw.countif(bucket_header, _q(b))))
+        rows.append(rowvals)
     widths = [18] + [max(10, len(str(c)) * 0.95) for c in cols] + [9]
-    sh.table(headers, rows, pct_cols=tuple(range(2, len(cols) + 2)),
+    sh.table(headers, rows, pct_cols=tuple(range(2, ncols + 2)),
              num_cols=(len(headers),), widths=widths)
 
 
-def write_rate_table(sh, title, frame, key_label, success_label, order, note=None):
-    """Generic count + success + rate table (day-of-week or week-block)."""
+def write_rate_table(sh, title, raw, key_header, key_label, present_keys,
+                     success_label, note=None):
+    """Count + success + rate by weekday or week-block, fully formula-driven."""
     sh.section(title)
     if note:
         sh.note(note)
+    data_start = sh.r + 1
     rows = []
-    present = [k for k in order if k in frame.index] if len(frame) else []
-    for k in present:
-        r = frame.loc[k]
-        rows.append([k, int(r["total"]), int(r["success"]), float(r["rate"])])
-    if rows:
-        tot = int(frame["total"].sum()); suc = int(frame["success"].sum())
-        rows.append(["Total", tot, suc, pct(suc, tot)])
+    if present_keys:
+        total_row = data_start + len(present_keys)
+        for i, k in enumerate(present_keys):
+            er = data_start + i
+            rows.append([k, EQ(raw.countif(key_header, _q(k))),
+                         EQ(raw.countifs([(key_header, _q(k)), (H_ISCONNECT, _q("Yes"))])),
+                         EQ(IFERR(f"C{er}/B{er}", "0"))])
+        rows.append(["Total", EQ(f"SUM(B{data_start}:B{total_row - 1})"),
+                     EQ(f"SUM(C{data_start}:C{total_row - 1})"),
+                     EQ(IFERR(f"C{total_row}/B{total_row}", "0"))])
     else:
         rows.append(["(no data)", 0, 0, 0.0])
     sh.table([key_label, "Calls", success_label, "Connect %"], rows,
-             pct_cols=(4,), num_cols=(2, 3), widths=[20, 14, 18, 14], total_row=bool(present))
+             pct_cols=(4,), num_cols=(2, 3), widths=[20, 14, 18, 14],
+             total_row=bool(present_keys))
 
 
-def write_best_day_per_week(sh, title, block_dow):
-    """Monthly: one row per week block showing its best day (by rate)."""
+def write_best_day_per_week(sh, title, raw, block_dow):
+    """Monthly: per week-block, the best day (chosen in pandas) with live
+    COUNTIFS numbers behind it."""
     sh.section(title)
+    data_start = sh.r + 1
     rows = []
-    for b in WEEKBLOCK_ORDER:
+    for i, b in enumerate(WEEKBLOCK_ORDER):
+        er = data_start + i
         frame = block_dow.get(b)
         bd = best_by_rate(frame) if frame is not None else None
         if bd:
-            day, suc, tot, rate = bd
-            rows.append([b, day, suc, tot, rate])
+            day = bd[0]
+            rows.append([b, day,
+                         EQ(raw.countifs([(H_WEEKBLOCK, _q(b)), (H_WEEKDAY, _q(day)),
+                                          (H_ISCONNECT, _q("Yes"))])),
+                         EQ(raw.countifs([(H_WEEKBLOCK, _q(b)), (H_WEEKDAY, _q(day))])),
+                         EQ(IFERR(f"C{er}/D{er}", "0"))])
         else:
             rows.append([b, "(no data)", 0, 0, 0.0])
     sh.table(["Week", "Best Day", "Success", "Calls", "Connect %"], rows,
              pct_cols=(5,), num_cols=(3, 4), widths=[18, 14, 12, 12, 14])
 
 
-def write_rate_window_table(sh, title, rate_frame, conn_label,
-                            cost_per_connect=None, note=None):
-    """Connect-RATE by time window: dials / connects / rate / dials-per-connect
-    (+ optional $/connect). Ranked chronologically so it reads like a day."""
+def write_rate_window_table(sh, title, raw, bucket_header, present_buckets,
+                            conn_label, cost_header=None, note=None):
+    """Connect-RATE by time window, all live formulas: dials = COUNTIF(bucket),
+    connects = COUNTIFS(bucket, Is Connect=Yes), rate/dials-per-connect = cell
+    ratios, $/connect = SUMIF(spend in window) / connects."""
     sh.section(title)
     if note:
         sh.note(note)
-    has_cost = cost_per_connect is not None and len(cost_per_connect) > 0
-    headers = ["Time Window (EST)", "Dials", conn_label, "Connect %", "Dials / Connect"]
+    has_cost = bool(cost_header) and raw.has(cost_header)
+    headers = ["Time Window", "Dials", conn_label, "Connect %", "Dials / Connect"]
     if has_cost:
         headers.append("$ / Connect")
+    data_start = sh.r + 1
     rows = []
-    present = [b for b in BUCKET_ORDER if b in rate_frame.index] if len(rate_frame) else []
-    for b in present:
-        r = rate_frame.loc[b]
-        tot, suc, rate = int(r["total"]), int(r["success"]), float(r["rate"])
-        dpc = (tot / suc) if suc else 0
-        row = [b, tot, suc, rate, (round(dpc, 1) if suc else "-")]
-        if has_cost:
-            row.append(float(cost_per_connect.get(b, 0)) if b in cost_per_connect.index else "-")
-        rows.append(row)
-    if present:
-        T = int(rate_frame["total"].sum()); S = int(rate_frame["success"].sum())
-        trow = ["Total", T, S, pct(S, T), (round(T / S, 1) if S else "-")]
+    if present_buckets:
+        total_row = data_start + len(present_buckets)
+        for i, b in enumerate(present_buckets):
+            er = data_start + i
+            row = [b, EQ(raw.countif(bucket_header, _q(b))),
+                   EQ(raw.countifs([(bucket_header, _q(b)), (H_ISCONNECT, _q("Yes"))])),
+                   EQ(IFERR(f"C{er}/B{er}", "0")),
+                   EQ(IFERR(f"B{er}/C{er}", '"-"'))]
+            if has_cost:
+                spend = raw.sumif(bucket_header, _q(b), cost_header)
+                row.append(EQ(IFERR(f"{spend}/C{er}", '"-"')))
+            rows.append(row)
+        trow = ["Total", EQ(f"SUM(B{data_start}:B{total_row - 1})"),
+                EQ(f"SUM(C{data_start}:C{total_row - 1})"),
+                EQ(IFERR(f"C{total_row}/B{total_row}", "0")),
+                EQ(IFERR(f"B{total_row}/C{total_row}", '"-"'))]
         if has_cost:
             trow.append("")
         rows.append(trow)
@@ -881,12 +1072,12 @@ def write_rate_window_table(sh, title, rate_frame, conn_label,
     widths = [20, 12, 14, 12, 16] + ([14] if has_cost else [])
     money = (6,) if has_cost else ()
     sh.table(headers, rows, pct_cols=(4,), num_cols=(2, 3), money_cols=money,
-             widths=widths, total_row=bool(present))
+             widths=widths, total_row=bool(present_buckets))
 
 
-def write_heatmap(sh, title, rate_mat, tot_mat, note=None):
-    """Weekday x time-window connect-rate grid with a red->green color scale.
-    A second grid shows dial volume so high rates on thin volume are obvious."""
+def write_heatmap(sh, title, raw, bucket_header, rate_mat, tot_mat, note=None):
+    """Weekday x time-window grid. Rate cells = COUNTIFS(connected)/COUNTIFS(all)
+    live; volume cells = COUNTIFS(all) live. Red->green color scale on rates."""
     sh.section(title)
     if note:
         sh.note(note)
@@ -910,12 +1101,13 @@ def write_heatmap(sh, title, rate_mat, tot_mat, note=None):
         cell = ws.cell(sh.r, 1, day)
         cell.font = f(9, True); cell.border = BORDER
         for j, c in enumerate(cols, start=2):
-            v = rate_mat.loc[day, c]
-            cc = ws.cell(sh.r, j)
+            num = raw.countifs([(H_WEEKDAY, _q(day)), (bucket_header, _q(c)),
+                                (H_ISCONNECT, _q("Yes"))])
+            den = raw.countifs([(H_WEEKDAY, _q(day)), (bucket_header, _q(c))])
+            cc = ws.cell(sh.r, j, EQ(IFERR(f"{num}/{den}", '""')))
             cc.border = BORDER
             cc.alignment = Alignment(horizontal="center")
-            if pd.notna(v):
-                cc.value = float(v); cc.number_format = "0%"
+            cc.number_format = "0%"
         sh.r += 1
     last_data = sh.r - 1
     rng = f"{get_column_letter(2)}{first_data}:{get_column_letter(1 + len(cols))}{last_data}"
@@ -940,8 +1132,8 @@ def write_heatmap(sh, title, rate_mat, tot_mat, note=None):
     for day in tot_mat.index:
         ws.cell(sh.r, 1, day).font = f(9, True); ws.cell(sh.r, 1).border = BORDER
         for j, c in enumerate(cols, start=2):
-            v = int(tot_mat.loc[day, c])
-            cc = ws.cell(sh.r, j, v if v else None)
+            cc = ws.cell(sh.r, j, EQ(raw.countifs([(H_WEEKDAY, _q(day)),
+                                                   (bucket_header, _q(c))])))
             cc.border = BORDER; cc.number_format = "#,##0"
             cc.alignment = Alignment(horizontal="center")
         sh.r += 1
@@ -1089,24 +1281,47 @@ def write_leadership_movement(sh, comparisons):
     sh.blank()
 
 
-def write_ib_disposition_tabs(wb, ad):
+def write_ib_disposition_tabs(wb, ad, raw, talk_h=None):
     """Two current-period drill-down tabs from the agent-disposition layer:
     'IB Agents' (per-agent performance) and 'IB Dispositions' (response-code
-    distribution + class/party/outcome rollups). No-op when the dump has no
-    disposition column."""
+    distribution + class/party/outcome rollups). All numbers are live
+    COUNTIFS/AVERAGEIFS formulas over the embedded IB_RawData sheet. No-op when
+    the dump has no disposition column. `talk_h` = the dump's talk-duration
+    column name (for live AVERAGEIFS), or None to fall back to the computed avg."""
     if not ad:
         return
+    has_talk = bool(talk_h) and raw.has(talk_h)
     # ---------------------------- IB Agents ---------------------------- #
     ws = wb.create_sheet("IB Agents"); ws.sheet_view.showGridLines = False
     sh = Sheet(ws)
     sh.title("Inbound — Agent Performance",
              "Per-agent outcomes on agent-handled calls. Connect = response "
              "code starts C-. Ranked by calls handled.")
-    rows = [[r["agent"], r["handled"], r["connected"], r["rate"], r["ptp"],
-             r["payment"], round(r["avg_talk"], 1), r["top_disp"]]
-            for r in ad["agents"]]
-    if rows:
+    agents = ad["agents"]
+    if agents:
         sh.section(f"Agents ranked by calls handled ({ad['n_agents']} agent(s))")
+        data_start = sh.r + 1
+        rows = []
+        for i, r in enumerate(agents):
+            er = data_start + i
+            a = _q(r["agent"])
+            handled = raw.countifs([(H_AGENT, a), (H_HASDISP, _q("Yes"))])
+            conn = raw.countifs([(H_AGENT, a), (H_HASDISP, _q("Yes")),
+                                 (H_DISP_CONN, _q("Yes"))])
+            ptp = raw.countifs([(H_AGENT, a), (H_HASDISP, _q("Yes")),
+                                (H_DISP_OUTCOME, _q("PTP"))])
+            pay = raw.countifs([(H_AGENT, a), (H_HASDISP, _q("Yes")),
+                                (H_DISP_OUTCOME, _q("PAYMENT"))])
+            row = [r["agent"], EQ(handled), EQ(conn),
+                   EQ(IFERR(f"C{er}/B{er}", "0")), EQ(ptp), EQ(pay)]
+            # avg talk = AVERAGEIFS over the dump's talk column if present
+            if has_talk:
+                row.append(EQ(IFERR(raw.averageifs(
+                    talk_h, [(H_AGENT, a), (H_HASDISP, _q("Yes"))]), "0")))
+            else:
+                row.append(round(r["avg_talk"], 1))
+            row.append(r["top_disp"])
+            rows.append(row)
         sh.table(["Agent", "Handled", "Connected", "Connect %", "PTP",
                   "Payment", "Avg talk (s)", "Top disposition"], rows,
                  pct_cols=(4,), num_cols=(2, 3, 5, 6, 7),
@@ -1116,11 +1331,11 @@ def write_ib_disposition_tabs(wb, ad):
         sh.note("Every inbound call this period was system-handled "
                 "(abandoned / voicemail / not connected).")
     if ad.get("agent_blank"):
-        b = ad["agent_blank"]
         sh.blank()
         sh.section("System / Unassigned (not agent-handled)")
         sh.kv("Calls (abandoned / voicemail / not connected)",
-              b["handled"], "#,##0", color=GREY, bold_val=True)
+              EQ(raw.countif(H_AGENT, _q(AGENT_BLANK_LABEL))),
+              "#,##0", color=GREY, bold_val=True)
 
     # ------------------------- IB Dispositions ------------------------- #
     ws = wb.create_sheet("IB Dispositions"); ws.sheet_view.showGridLines = False
@@ -1128,24 +1343,33 @@ def write_ib_disposition_tabs(wb, ad):
     sh.title("Inbound — Agent Dispositions",
              "'An Agent Call Response' breakdown. Codes parse as "
              "class (C/NC) · party (RPC/TPC) · outcome.")
-    tot = ad["disp_total"]
     sh.section("Connectivity (of dispositioned calls)")
-    sh.kv("Dispositioned calls", tot, "#,##0", bold_val=True)
-    sh.kv("Connected (C-*)", ad["disp_connected"], "#,##0", color=GREEN, bold_val=True)
-    sh.kv("Connected rate", ad["disp_connected_rate"], "0.0%", bold_val=True)
+    disp_total_expr = raw.countif(H_HASDISP, _q("Yes"))
+    disp_total_row = sh.r
+    sh.kv("Dispositioned calls", EQ(disp_total_expr), "#,##0", bold_val=True)
+    sh.kv("Connected (C-*)", EQ(raw.countif(H_DISP_CONN, _q("Yes"))),
+          "#,##0", color=GREEN, bold_val=True)
+    sh.kv("Connected rate", EQ(IFERR(f"B{disp_total_row + 1}/B{disp_total_row}", "0")),
+          "0.0%", bold_val=True)
     sh.blank()
+    denom = f"$B${disp_total_row}"
     dc = ad["disp_counts"]
-    rows = [[idx, int(v), pct(v, tot)] for idx, v in dc.items()]
-    rows.append(["Total", tot, 1.0])
     sh.section("Full disposition distribution")
-    sh.table(["Disposition", "Calls", "% of dispositioned"], rows,
-             pct_cols=(3,), num_cols=(2,), widths=[28, 14, 18], total_row=True)
-    for title2, series in (("By contact class", ad.get("by_class")),
-                           ("By party", ad.get("by_party")),
-                           ("By outcome", ad.get("by_outcome"))):
+    _count_pct_table(sh, ["Disposition", "Calls", "% of dispositioned"],
+                     [(idx, raw.countif(H_DISP_CODE, _q(idx))) for idx in dc.index],
+                     (28, 14, 18))
+    for title2, series, crit_h in (
+            ("By contact class", ad.get("by_class"), H_DISP_CLASS),
+            ("By party", ad.get("by_party"), H_DISP_PARTY),
+            ("By outcome", ad.get("by_outcome"), H_DISP_OUTCOME)):
         if series is not None and len(series):
-            rows = [[idx, int(v), pct(v, tot)] for idx, v in series.items()]
             sh.section(title2)
+            data_start = sh.r + 1
+            rows = []
+            for i, idx in enumerate(series.index):
+                er = data_start + i
+                rows.append([idx, EQ(raw.countif(crit_h, _q(idx))),
+                             EQ(IFERR(f"B{er}/{denom}", "0"))])
             sh.table(["Segment", "Calls", "% of dispositioned"], rows,
                      pct_cols=(3,), num_cols=(2,), widths=[28, 14, 18])
 
@@ -1232,16 +1456,18 @@ def write_leadership_alerts(sh, alerts):
     sh.blank()
 
 
-def _stream_period_tabs(wb, prefix, res, period, success_label):
+def _stream_period_tabs(wb, prefix, res, period, success_label, raw):
     """Add period-specific tabs (Day of Week for weekly+monthly; Week Breakdown
-    + Best Day per Week for monthly) for one stream (OB or IB)."""
+    + Best Day per Week for monthly) for one stream (OB or IB). All numbers are
+    live COUNTIF/COUNTIFS formulas over `raw` (the embedded *_RawData sheet)."""
     if period in ("weekly", "monthly"):
         ws = wb.create_sheet(f"{prefix} Day of Week"); ws.sheet_view.showGridLines = False
         sh = Sheet(ws)
         sh.title(f"{prefix} — Day of Week",
                  "Connectivity by weekday. 'Best' day = highest connect rate.")
-        write_rate_table(sh, "By day of week", res.get("dow"),
-                         "Day", success_label, WEEKDAY_ORDER)
+        dow = res.get("dow")
+        write_rate_table(sh, "By day of week", raw, H_WEEKDAY, "Day",
+                         list(dow.index) if dow is not None else [], success_label)
         bd = best_by_rate(res.get("dow"))
         wd = best_by_rate(res.get("dow"), want="worst")
         if bd:
@@ -1256,8 +1482,9 @@ def _stream_period_tabs(wb, prefix, res, period, success_label):
         sh = Sheet(ws)
         sh.title(f"{prefix} — Week Breakdown",
                  "Weeks: 1-7, 8-14, 15-21, 22-end. 'Best' week = highest connect rate.")
-        write_rate_table(sh, "By week of month", res.get("weekblock"),
-                         "Week", success_label, WEEKBLOCK_ORDER)
+        wkb = res.get("weekblock")
+        write_rate_table(sh, "By week of month", raw, H_WEEKBLOCK, "Week",
+                         list(wkb.index) if wkb is not None else [], success_label)
         bw = best_by_rate(res.get("weekblock"))
         ww = best_by_rate(res.get("weekblock"), want="worst")
         if bw:
@@ -1267,12 +1494,26 @@ def _stream_period_tabs(wb, prefix, res, period, success_label):
             sh.kv("Worst week (by rate)", f"{ww[0]} — {ww[3]:.1%} ({ww[1]}/{ww[2]})",
                   color=RED, bold_val=True)
         sh.blank()
-        write_best_day_per_week(sh, "Best day within each week", res.get("block_dow", {}))
+        write_best_day_per_week(sh, "Best day within each week", raw,
+                                res.get("block_dow", {}))
 
 
 def build_workbook(client, period, date_label, ob_res, ib_res, out_path,
                    comparisons=None, alerts=None):
     wb = Workbook()
+    # ---- prepare embedded raw-data sheets (every analytical formula points
+    # here so leadership can click a cell and see the COUNTIF/SUMIF derivation).
+    # The sheets themselves are written at the very end; we only need their
+    # RawRef (title + headers + row count) to author the formulas now. ----
+    ob_meta = ob_res["_df"].attrs["meta"] if ob_res else None
+    ib_meta = ib_res["_df"].attrs["meta"] if ib_res else None
+    ob_raw_df = _prep_raw(ob_res["_df"], ob_meta, "OB") if ob_res else None
+    ib_raw_df = _prep_raw(ib_res["_df"], ib_meta, "IB") if ib_res else None
+    ob_raw = RawRef("OB_RawData", list(ob_raw_df.columns), len(ob_raw_df)) if ob_res else None
+    ib_raw = RawRef("IB_RawData", list(ib_raw_df.columns), len(ib_raw_df)) if ib_res else None
+    ob_result_h = ob_meta["result"] if ob_res else None
+    ob_cost_h = ob_meta.get("total_cost") if ob_res else None
+    ib_result_h = ib_meta["result"] if ib_res else None
     # ===================================================================== #
     # LEADERSHIP VIEW  --  the one page leaders read; everything else is a   #
     # drill-down ("double click") tab.                                       #
@@ -1286,15 +1527,15 @@ def build_workbook(client, period, date_label, ob_res, ib_res, out_path,
 
     if ob_res:
         sh.section("Outbound — the bottom line")
-        items = [("Dials", ob_res["total"], "#,##0", "FFFFFF"),
-                 ("Connects", ob_res["answered_linkcalls"], "#,##0", "C6E0B4"),
-                 ("Connect rate", ob_res["connectivity"], "0.0%", "C6E0B4"),
-                 ("Dials / connect",
-                  round(ob_res["dials_per_connect"], 1) if ob_res.get("dials_per_connect") else "-",
-                  "0.0", "FFFFFF")]
-        if ob_res.get("total_cost") is not None:
-            items.append(("$ / connect", ob_res.get("cost_per_al", 0), '$#,##0.000', "FFE699"))
-            items.append(("Total spend", ob_res.get("total_cost", 0), '$#,##0', "FFFFFF"))
+        vr = sh.r + 1   # KPI value row (formulas reference cells in this row)
+        items = [("Dials", EQ(ob_raw.counta(ob_result_h)), "#,##0", "FFFFFF"),
+                 ("Connects", EQ(ob_raw.countif(H_ISCONNECT, _q("Yes"))), "#,##0", "C6E0B4"),
+                 ("Connect rate", EQ(IFERR(f"B{vr}/A{vr}", "0")), "0.0%", "C6E0B4"),
+                 ("Dials / connect", EQ(IFERR(f"A{vr}/B{vr}", '"-"')), "0.0", "FFFFFF")]
+        if ob_res.get("total_cost") is not None and ob_cost_h:
+            spend = ob_raw.sum(ob_cost_h)
+            items.append(("$ / connect", EQ(IFERR(f"({spend})/B{vr}", "0")), '$#,##0.000', "FFE699"))
+            items.append(("Total spend", EQ(spend), '$#,##0', "FFFFFF"))
         sh.kpi_row(items)
         sh.blank()
 
@@ -1342,11 +1583,12 @@ def build_workbook(client, period, date_label, ob_res, ib_res, out_path,
 
     if ib_res:
         sh.section("Inbound — the bottom line")
-        items = [("Calls", ib_res["total"], "#,##0", "FFFFFF"),
-                 ("Connected", ib_res["connected"], "#,##0", "C6E0B4"),
-                 ("Connect rate", ib_res["connectivity"], "0.0%", "C6E0B4"),
-                 ("Missed", ib_res["miss_total"], "#,##0", "F4B0A6"),
-                 ("Miss rate", ib_res.get("miss_rate", 0), "0.0%", "F4B0A6")]
+        vr = sh.r + 1
+        items = [("Calls", EQ(ib_raw.counta(ib_result_h)), "#,##0", "FFFFFF"),
+                 ("Connected", EQ(ib_raw.countif(H_ISCONNECT, _q("Yes"))), "#,##0", "C6E0B4"),
+                 ("Connect rate", EQ(IFERR(f"B{vr}/A{vr}", "0")), "0.0%", "C6E0B4"),
+                 ("Missed", EQ(ib_raw.countif(H_ISCONNECT, _q("No"))), "#,##0", "F4B0A6"),
+                 ("Miss rate", EQ(IFERR(f"D{vr}/A{vr}", "0")), "0.0%", "F4B0A6")]
         sh.kpi_row(items)
         sh.blank()
         sh.section("Inbound staffing signal")
@@ -1364,7 +1606,9 @@ def build_workbook(client, period, date_label, ob_res, ib_res, out_path,
         if ad:
             sh.section("Inbound — agents & dispositions")
             sh.kv("Connected (C-*) rate of dispositioned calls",
-                  ad["disp_connected_rate"], "0.0%", color=GREEN, bold_val=True)
+                  EQ(IFERR(f"{ib_raw.countif(H_DISP_CONN, _q('Yes'))}/"
+                           f"{ib_raw.countif(H_HASDISP, _q('Yes'))}", "0")),
+                  "0.0%", color=GREEN, bold_val=True)
             if ad["agents"]:
                 ranked = [a for a in ad["agents"] if a["handled"] >= 5] or ad["agents"]
                 top = max(ranked, key=lambda a: a["rate"])
@@ -1437,29 +1681,34 @@ def build_workbook(client, period, date_label, ob_res, ib_res, out_path,
         ws = wb.create_sheet("OB Summary"); ws.sheet_view.showGridLines = False
         sh = Sheet(ws); sh.title("Outbound — Summary & Result Breakdown")
         rc = ob_res["result_counts"]; tot = ob_res["total"]
-        rows = [[idx, int(v), pct(v, tot)] for idx, v in rc.items()]
-        rows.append(["Total", tot, 1.0])
         sh.section("Result breakdown (all dials)")
-        sh.table(["Result", "Calls", "% of dials"], rows, pct_cols=(3,), num_cols=(2,),
-                 widths=[26, 14, 14], total_row=True)
+        _count_pct_table(sh, ["Result", "Calls", "% of dials"],
+                         [(idx, ob_raw.countif(ob_result_h, _q(idx))) for idx in rc.index],
+                         (26, 14, 14))
         sh.section("Connectivity")
-        sh.kv("Answered linkcalls", ob_res["answered_linkcalls"], "#,##0", color=GREEN, bold_val=True)
-        sh.kv("Connectivity rate", ob_res["connectivity"], "0.0%", bold_val=True)
-        sh.kv("Dials per connect", round(ob_res["dials_per_connect"], 1) if ob_res.get("dials_per_connect") else "-", "0.0")
+        total_dials = ob_raw.counta(ob_result_h)
+        al_row = sh.r
+        sh.kv("Answered linkcalls", EQ(ob_raw.countif(H_ISCONNECT, _q("Yes"))),
+              "#,##0", color=GREEN, bold_val=True)
+        sh.kv("Connectivity rate", EQ(IFERR(f"B{al_row}/({total_dials})", "0")),
+              "0.0%", bold_val=True)
+        sh.kv("Dials per connect", EQ(IFERR(f"({total_dials})/B{al_row}", '"-"')), "0.0")
 
         ws = wb.create_sheet("OB Best Time to Call"); ws.sheet_view.showGridLines = False
         sh = Sheet(ws); sh.title("Outbound — Best Time to Call",
                                  "Ranked by CONNECT RATE with volume + $/connect — your scheduling guide.")
-        write_rate_window_table(sh, "Connect rate by EST window (campaign time)", ob_res["rate_est"],
-                                "Connects", cost_per_connect=ob_res.get("cost_per_connect_est"),
+        write_rate_window_table(sh, "Connect rate by EST window (campaign time)", ob_raw,
+                                "EST Bucket", list(ob_res["rate_est"].index), "Connects",
+                                cost_header=ob_cost_h,
                                 note="Higher Connect % = better window. Dials/Connect = dials needed to expect one connect.")
-        write_rate_window_table(sh, "Connect rate by IST window (team time)", ob_res["rate_ist"], "Connects")
+        write_rate_window_table(sh, "Connect rate by IST window (team time)", ob_raw,
+                                "IST Bucket", list(ob_res["rate_ist"].index), "Connects")
 
         if period in ("weekly", "monthly"):
             ws = wb.create_sheet("OB Heatmap"); ws.sheet_view.showGridLines = False
             sh = Sheet(ws); sh.title("Outbound — Connect-Rate Heatmap",
                                      "Weekday × time-of-day (EST). Greener = higher connect rate.")
-            write_heatmap(sh, "Connect % by weekday and EST window",
+            write_heatmap(sh, "Connect % by weekday and EST window", ob_raw, "EST Bucket",
                           ob_res.get("heat_rate"), ob_res.get("heat_tot"),
                           note="Target the greenest cells that also carry real dial volume.")
 
@@ -1467,85 +1716,134 @@ def build_workbook(client, period, date_label, ob_res, ib_res, out_path,
         sh = Sheet(ws); sh.title("Outbound — Outcomes & Waste",
                                  "Where dials go when they don't connect — and when.")
         if wc is not None and len(wc) and tot:
-            rows = [[idx, int(v), pct(v, tot)] for idx, v in wc.items()]
-            rows.append(["All non-connects", int(wc.sum()), pct(int(wc.sum()), tot)])
             sh.section("Non-connect outcomes (dial leak, ranked)")
+            data_start = sh.r + 1
+            total_row = data_start + len(wc)
+            rows = []
+            for i, idx in enumerate(wc.index):
+                er = data_start + i
+                rows.append([idx, EQ(ob_raw.countif(ob_result_h, _q(idx))),
+                             EQ(IFERR(f"B{er}/({total_dials})", "0"))])
+            rows.append(["All non-connects", EQ(f"SUM(B{data_start}:B{total_row - 1})"),
+                         EQ(IFERR(f"B{total_row}/({total_dials})", "0"))])
             sh.table(["Outcome", "Dials", "% of dials"], rows, pct_cols=(3,), num_cols=(2,),
                      widths=[26, 14, 14], total_row=True)
-        write_outcome_matrix(sh, "Counts by EST window", ob_res["outcomes_est"])
-        write_outcome_matrix_pct(sh, "Within-window % by EST window", ob_res["outcomes_est"])
+        write_outcome_matrix(sh, "Counts by EST window", ob_raw, "EST Bucket",
+                             ob_result_h, ob_res["outcomes_est"])
+        write_outcome_matrix_pct(sh, "Within-window % by EST window", ob_raw, "EST Bucket",
+                                 ob_result_h, ob_res["outcomes_est"])
 
         ws = wb.create_sheet("OB Cost"); ws.sheet_view.showGridLines = False
         sh = Sheet(ws); sh.title("Outbound — Cost Analysis")
+        has_cost = ob_res.get("total_cost") is not None and ob_cost_h
+        deliv_h = ob_meta.get("delivery_cost"); link_h = ob_meta.get("linkback_cost")
         sh.section("Cost totals")
-        sh.kv("Delivery cost", ob_res.get("delivery_cost", 0), '$#,##0.000')
-        sh.kv("Linkback cost", ob_res.get("linkback_cost", 0), '$#,##0.000')
-        sh.kv("Total cost", ob_res.get("total_cost", 0), '$#,##0.000', bold_val=True)
-        sh.kv("Cost per dial", ob_res.get("cost_per_dial", 0), '$#,##0.0000')
-        sh.kv("Cost per connect", ob_res.get("cost_per_al", 0), '$#,##0.0000', color=AMBER, bold_val=True)
-        sh.blank()
-        sh.section("Connected vs wasted spend")
-        sh.kv("Spend that produced a connect", ob_res.get("cost_connected", 0), '$#,##0.000', color=GREEN, bold_val=True)
-        sh.kv("Spend on dials that didn't connect", ob_res.get("cost_wasted", 0), '$#,##0.000', color=RED, bold_val=True)
-        sh.blank()
-        cpc = ob_res.get("cost_per_connect_est")
-        if cpc is not None and len(cpc):
-            rows = [[b, float(cpc[b])] for b in BUCKET_ORDER if b in cpc.index]
-            sh.section("Cost per connect by EST window (cheapest = best)")
-            sh.table(["Time Window", "$ / Connect"], rows, money_cols=(2,), widths=[20, 16])
-        if "cost_by_result" in ob_res:
-            cbr = ob_res["cost_by_result"]
-            rows = [[idx, float(v)] for idx, v in cbr.items()]
-            rows.append(["Total", float(cbr.sum())])
-            sh.section("Cost by result")
-            sh.table(["Result", "Total Cost ($)"], rows, money_cols=(2,), widths=[26, 18], total_row=True)
+        if deliv_h and ob_raw.has(deliv_h):
+            sh.kv("Delivery cost", EQ(ob_raw.sum(deliv_h)), '$#,##0.000')
+        if link_h and ob_raw.has(link_h):
+            sh.kv("Linkback cost", EQ(ob_raw.sum(link_h)), '$#,##0.000')
+        tc_row = sh.r
+        if has_cost:
+            sh.kv("Total cost", EQ(ob_raw.sum(ob_cost_h)), '$#,##0.000', bold_val=True)
+            sh.kv("Cost per dial", EQ(IFERR(f"B{tc_row}/({total_dials})", "0")), '$#,##0.0000')
+            sh.kv("Cost per connect",
+                  EQ(IFERR(f"B{tc_row}/{ob_raw.countif(H_ISCONNECT, _q('Yes'))}", "0")),
+                  '$#,##0.0000', color=AMBER, bold_val=True)
+            sh.blank()
+            sh.section("Connected vs wasted spend")
+            sh.kv("Spend that produced a connect",
+                  EQ(ob_raw.sumif(H_ISCONNECT, _q("Yes"), ob_cost_h)),
+                  '$#,##0.000', color=GREEN, bold_val=True)
+            sh.kv("Spend on dials that didn't connect",
+                  EQ(ob_raw.sumif(H_ISCONNECT, _q("No"), ob_cost_h)),
+                  '$#,##0.000', color=RED, bold_val=True)
+            sh.blank()
+            cpc = ob_res.get("cost_per_connect_est")
+            if cpc is not None and len(cpc):
+                sh.section("Cost per connect by EST window (cheapest = best)")
+                rows = []
+                for b in BUCKET_ORDER:
+                    if b in cpc.index:
+                        spend = ob_raw.sumif("EST Bucket", _q(b), ob_cost_h)
+                        conn = ob_raw.countifs([("EST Bucket", _q(b)), (H_ISCONNECT, _q("Yes"))])
+                        rows.append([b, EQ(IFERR(f"({spend})/{conn}", '"-"'))])
+                sh.table(["Time Window", "$ / Connect"], rows, money_cols=(2,), widths=[20, 16])
+            cbr = ob_res.get("cost_by_result")
+            if cbr is not None and len(cbr):
+                sh.section("Cost by result")
+                data_start = sh.r + 1
+                total_row = data_start + len(cbr)
+                rows = [[idx, EQ(ob_raw.sumif(ob_result_h, _q(idx), ob_cost_h))]
+                        for idx in cbr.index]
+                rows.append(["Total", EQ(f"SUM(B{data_start}:B{total_row - 1})")])
+                sh.table(["Result", "Total Cost ($)"], rows, money_cols=(2,),
+                         widths=[26, 18], total_row=True)
 
-        _stream_period_tabs(wb, "OB", ob_res, period, "Answered Linkcalls")
+        _stream_period_tabs(wb, "OB", ob_res, period, "Answered Linkcalls", ob_raw)
 
     # ----- IB detail tabs ----- #
     if ib_res:
         ws = wb.create_sheet("IB Summary"); ws.sheet_view.showGridLines = False
         sh = Sheet(ws); sh.title("Inbound — Summary & Result Breakdown")
         rc = ib_res["result_counts"]; tot = ib_res["total"]
-        rows = [[idx, int(v), pct(v, tot)] for idx, v in rc.items()]
-        rows.append(["Total", tot, 1.0])
         sh.section("Result breakdown (all inbound)")
-        sh.table(["Result", "Calls", "% of inbound"], rows, pct_cols=(3,), num_cols=(2,),
-                 widths=[26, 14, 14], total_row=True)
+        _count_pct_table(sh, ["Result", "Calls", "% of inbound"],
+                         [(idx, ib_raw.countif(ib_result_h, _q(idx))) for idx in rc.index],
+                         (26, 14, 14))
         sh.section("Connectivity")
-        sh.kv("Connected (Answered Linkcall + Answered)", ib_res["connected"], "#,##0", color=GREEN, bold_val=True)
-        sh.kv("Connectivity rate", ib_res["connectivity"], "0.0%", bold_val=True)
-        sh.kv("Missed / not connected", ib_res["miss_total"], "#,##0", color=RED, bold_val=True)
-        sh.kv("Miss rate", ib_res.get("miss_rate", 0), "0.0%", color=RED)
-        if ib_res.get("avg_talk") is not None:
-            sh.kv("Avg agent talk time (sec)", round(ib_res.get("avg_talk", 0), 1), "0.0")
+        total_ib = ib_raw.counta(ib_result_h)
+        conn_row = sh.r
+        sh.kv("Connected (Answered Linkcall + Answered)",
+              EQ(ib_raw.countif(H_ISCONNECT, _q("Yes"))), "#,##0", color=GREEN, bold_val=True)
+        sh.kv("Connectivity rate", EQ(IFERR(f"B{conn_row}/({total_ib})", "0")),
+              "0.0%", bold_val=True)
+        miss_row = sh.r
+        sh.kv("Missed / not connected", EQ(ib_raw.countif(H_ISCONNECT, _q("No"))),
+              "#,##0", color=RED, bold_val=True)
+        sh.kv("Miss rate", EQ(IFERR(f"B{miss_row}/({total_ib})", "0")), "0.0%", color=RED)
+        ib_talk_h = ib_meta.get("talk_dur")
+        if ib_res.get("avg_talk") is not None and ib_talk_h and ib_raw.has(ib_talk_h):
+            sh.kv("Avg agent talk time (sec)",
+                  EQ(IFERR(f"AVERAGE({ib_raw.rng(ib_talk_h)})", "0")), "0.0")
 
         ws = wb.create_sheet("IB Best Time & Missed"); ws.sheet_view.showGridLines = False
         sh = Sheet(ws); sh.title("Inbound — Best Time & Missed",
                                  "Connect & miss rate by window — when inbound demand peaks and where it goes unanswered.")
-        write_rate_window_table(sh, "Connect rate by EST window", ib_res["rate_est"], "Connected",
+        write_rate_window_table(sh, "Connect rate by EST window", ib_raw, "EST Bucket",
+                                list(ib_res["rate_est"].index), "Connected",
                                 note="Connect % here = share of inbound calls in that window that reached an agent.")
-        write_distribution_table(sh, "Missed inbound by EST window", ib_res["miss_est"], "Missed Calls")
-        write_distribution_table(sh, "Missed inbound by IST window (team time)", ib_res["miss_ist"], "Missed Calls")
+        write_distribution_table(sh, "Missed inbound by EST window", ib_raw, "EST Bucket",
+                                 list(ib_res["miss_est"].index), "Missed Calls")
+        write_distribution_table(sh, "Missed inbound by IST window (team time)", ib_raw,
+                                 "IST Bucket", list(ib_res["miss_ist"].index), "Missed Calls")
 
         if period in ("weekly", "monthly"):
             ws = wb.create_sheet("IB Heatmap"); ws.sheet_view.showGridLines = False
             sh = Sheet(ws); sh.title("Inbound — Connect-Rate Heatmap",
                                      "Weekday × time-of-day (EST). Greener = higher connect rate.")
-            write_heatmap(sh, "Connect % by weekday and EST window",
+            write_heatmap(sh, "Connect % by weekday and EST window", ib_raw, "EST Bucket",
                           ib_res.get("heat_rate"), ib_res.get("heat_tot"),
                           note="Red cells with high volume = add agent coverage there.")
 
         ws = wb.create_sheet("IB Cost"); ws.sheet_view.showGridLines = False
         sh = Sheet(ws); sh.title("Inbound — Cost Analysis")
-        sh.kv("Inbound cost", ib_res.get("inbound_cost", 0), '$#,##0.000')
-        sh.kv("Total cost", ib_res.get("total_cost", 0), '$#,##0.000', bold_val=True)
-        if ib_res.get("total_talk") is not None:
-            sh.kv("Total agent talk time (sec)", round(ib_res.get("total_talk", 0), 0), "#,##0")
+        ib_inb_h = ib_meta.get("inbound_cost"); ib_tot_h = ib_meta.get("total_cost")
+        if ib_inb_h and ib_raw.has(ib_inb_h):
+            sh.kv("Inbound cost", EQ(ib_raw.sum(ib_inb_h)), '$#,##0.000')
+        if ib_tot_h and ib_raw.has(ib_tot_h):
+            sh.kv("Total cost", EQ(ib_raw.sum(ib_tot_h)), '$#,##0.000', bold_val=True)
+        if ib_res.get("total_talk") is not None and ib_talk_h and ib_raw.has(ib_talk_h):
+            sh.kv("Total agent talk time (sec)", EQ(ib_raw.sum(ib_talk_h)), "#,##0")
 
-        write_ib_disposition_tabs(wb, ib_res.get("agentdisp"))
+        write_ib_disposition_tabs(wb, ib_res.get("agentdisp"), ib_raw, talk_h=ib_talk_h)
 
-        _stream_period_tabs(wb, "IB", ib_res, period, "Connected Calls")
+        _stream_period_tabs(wb, "IB", ib_res, period, "Connected Calls", ib_raw)
+
+    # ----- embedded raw-data sheets (the source every formula points at) ----- #
+    if ob_res:
+        write_raw_sheet(wb, "OB_RawData", ob_raw_df)
+    if ib_res:
+        write_raw_sheet(wb, "IB_RawData", ib_raw_df)
 
     wb.save(out_path)
 

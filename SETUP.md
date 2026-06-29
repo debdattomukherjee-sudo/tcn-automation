@@ -256,6 +256,33 @@ second weekly run automatically.
 
 ---
 
+## Live formulas — every number is auditable (automatic — no setup)
+Leadership can click any analytical cell in the report and see exactly how it was
+derived. Instead of writing pre-computed numbers, the report embeds a copy of the
+raw dump and writes every within-period calculation as a **visible Excel formula**
+(`COUNTIF`, `COUNTIFS`, `SUMIF`, `SUMIFS`, `AVERAGEIFS`, and same-table cell
+ratios). Open any cell and the formula bar shows the lookup.
+
+Two extra tabs hold the source data the formulas point at:
+- **OB_RawData** — the full outbound dump plus helper columns (Weekday, Week
+  Block, Is Connect).
+- **IB_RawData** — the full inbound dump plus the same helpers, and for
+  dispositioned data: Agent Name, Disp Code, Has Disp, Disp Class / Party /
+  Outcome, Disp Connected.
+
+So a connect rate reads as `=Connects/Dials` (both live counts), `$ / connect` as
+`=SUMIF(spend in window)/connects`, the disposition split as
+`=COUNTIF(Disp Code, "C-RPC-PTP")`, and so on across OB, IB, agents and
+dispositions. Edit a raw row and every dependent number recalculates in Excel.
+
+What stays **computed** (by design): the cross-period **Trends** and **Alerts**
+tabs (they compare against the prior period stored in `history.json`, which isn't
+in the workbook), and the short argmax callouts on the Leadership page (e.g.
+"Best day — Tuesday") that simply point you to the detail tab where the underlying
+numbers are fully formula-driven.
+
+---
+
 ## Run it automatically every day (macOS scheduling)
 So you never have to run `run.py` by hand, install it as a daily LaunchAgent:
 ```
