@@ -62,7 +62,8 @@ OB_COLS = {
     "wrap_dur":       ["Agent Call Wrap up Duration"],
     "agent_first":    ["Agent First Name"],
     "agent_last":     ["Agent Last Name"],
-    "disposition":    ["An Agent Call Response", "Agent Call Response"],
+    "disposition":    ["Agent Dispositions", "An Agent Call Response",
+                       "Agent Call Response", "Agent Disposition"],
 }
 IB_COLS = {
     "timestamp":      ["Call Date-Time", "Start Time"],
@@ -77,7 +78,8 @@ IB_COLS = {
     "wrap_dur":       ["Agent Call Wrap up Duration"],
     "agent_first":    ["Agent First Name"],
     "agent_last":     ["Agent Last Name"],
-    "disposition":    ["An Agent Call Response", "Agent Call Response"],
+    "disposition":    ["An Agent Call Response", "Agent Call Response",
+                       "Agent Dispositions", "Agent Disposition"],
 }
 
 # Business definitions (kept as data, not hard rules in code, so they're visible)
