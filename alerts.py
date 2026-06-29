@@ -355,12 +355,13 @@ def _data_quality(rec, cfg):
 # --------------------------------------------------------------------------- #
 # Public: per-client evaluation                                                #
 # --------------------------------------------------------------------------- #
-def _disposition_alerts(blk, basis, cfg):
-    """Movement in the inbound agent-disposition mix (Col S 'An Agent Call
-    Response'). Headline = connected (C-*) share drop; plus any single
+def _disposition_alerts(blk, basis, cfg, stream="ib"):
+    """Movement in the agent-disposition mix ('An Agent Call Response') for the
+    given stream. Headline = connected (C-*) share drop; plus any single
     disposition whose share moved past the threshold."""
     out = []
-    moves = (blk or {}).get("ib_disp") or []
+    lab = stream.upper()
+    moves = (blk or {}).get(f"{stream}_disp") or []
     if not moves:
         return out
     # headline: connected (C-*) share of dispositioned calls dropping
@@ -368,7 +369,7 @@ def _disposition_alerts(blk, basis, cfg):
     cc = sum(m["current_share"] for m in moves if str(m["code"]).startswith("C-"))
     drop = (pc - cc) * 100
     if drop >= cfg.get("connected_disp_drop_pts", 5.0):
-        out.append(_a("ib_connected_disp_drop", "WARN", "IB",
+        out.append(_a(f"{stream}_connected_disp_drop", "WARN", lab,
                       "Connected dispositions", basis,
                       f"Connected (C-*) share of agent dispositions fell "
                       f"{drop:.1f} pts {basis} ({pc * 100:.1f}% → {cc * 100:.1f}%)",
@@ -389,7 +390,7 @@ def _disposition_alerts(blk, basis, cfg):
             verb = "disappeared"
         else:
             verb = "up" if m["share_delta"] > 0 else "down"
-        out.append(_a(f"disp_shift::{m['code']}", "INFO", "IB",
+        out.append(_a(f"{stream}_disp_shift::{m['code']}", "INFO", lab,
                       f"Disp {m['code']}", basis,
                       f"Disposition {m['code']} {verb} {basis}: "
                       f"{m['prior_share'] * 100:.1f}% → {m['current_share'] * 100:.1f}% "
@@ -399,11 +400,12 @@ def _disposition_alerts(blk, basis, cfg):
     return out
 
 
-def _agent_alerts(blk, basis, cfg):
-    """Per-agent connect-rate movement (Col K/L). Eligible agents must handle
-    >= agent_min_calls in BOTH periods. Drop = WARN, rise = INFO."""
+def _agent_alerts(blk, basis, cfg, stream="ib"):
+    """Per-agent connect-rate movement for the given stream. Eligible agents must
+    handle >= agent_min_calls in BOTH periods. Drop = WARN, rise = INFO."""
     out = []
-    moves = (blk or {}).get("ib_agents") or []
+    lab = stream.upper()
+    moves = (blk or {}).get(f"{stream}_agents") or []
     if not moves:
         return out
     move_thr = cfg.get("agent_connect_move_pts", 8.0) / 100.0
@@ -424,7 +426,7 @@ def _agent_alerts(blk, basis, cfg):
         d = m["rate_delta"] * 100
         sev = "WARN" if d < 0 else "INFO"
         direction = "up" if d > 0 else "down"
-        out.append(_a(f"agent_move::{m['agent']}", sev, "IB",
+        out.append(_a(f"{stream}_agent_move::{m['agent']}", sev, lab,
                       f"Agent {m['agent']}", basis,
                       f"Agent {m['agent']} connect rate {direction} {abs(d):.1f} pts "
                       f"{basis} ({m['prior_rate'] * 100:.1f}% → "
@@ -447,8 +449,10 @@ def evaluate(rec, comparisons, hist, cfg=None, targets=None):
     if blk:
         alerts += _delta_alerts(blk, basis, cfg)
         alerts += _window_drift_alert(blk, cfg)
-        alerts += _disposition_alerts(blk, basis, cfg)
-        alerts += _agent_alerts(blk, basis, cfg)
+        alerts += _disposition_alerts(blk, basis, cfg, "ob")
+        alerts += _agent_alerts(blk, basis, cfg, "ob")
+        alerts += _disposition_alerts(blk, basis, cfg, "ib")
+        alerts += _agent_alerts(blk, basis, cfg, "ib")
     alerts += _level_alerts(rec, cfg)
     alerts += _streak_alert(rec, hist, cfg)
     alerts += _baseline_alert(rec, hist, cfg)

@@ -213,12 +213,16 @@ Tuning thresholds lives in **`config.py`**:
 
 ---
 
-## Inbound agents & dispositions (automatic — no setup)
-The inbound dump carries three columns the older reports ignored: **Agent First
-Name** (Col K), **Agent Last Name** (Col L) and **An Agent Call Response** (Col
-S, the disposition). The engine now reads all three and adds a full agent +
-disposition layer on the same Analysis → drill-down → trends → alerts pattern as
-everything else.
+## Agents & dispositions — both streams (automatic — no setup)
+Both dumps now carry agent + disposition columns: **Agent First Name**, **Agent
+Last Name** and **An Agent Call Response** (the disposition), plus **Agent Call
+Talk / Hold / Wrap-up Duration**. The engine reads them on **both outbound and
+inbound** and adds a full agent + disposition layer on the same Analysis →
+drill-down → trends → alerts pattern as everything else.
+
+> Note on the OB dump: starting 2026-06-29 these extra columns (Col R onward) are
+> added **manually** to every outbound dump. The engine matches them by header
+> name, so column position doesn't matter — drop them anywhere to the right.
 
 Disposition codes are read as structured `class-party-outcome` (e.g.
 `C-RPC-PTP` = **C**onnected, **R**ight-**P**arty **C**ontact, **P**romise To
@@ -226,21 +230,25 @@ Pay). Anything starting with `C-` counts as **connected**. Rows with no agent
 name are system calls (abandoned / voicemail / hang-up before pickup) — they're
 bucketed as **"System / Unassigned"** and kept out of the per-agent rankings.
 
-Two new tabs in each report:
-- **IB Agents** — one row per named agent: calls handled, connected, connect
-  rate, PTP / Payment / No-PTP counts, average talk time and their most common
-  disposition, ranked by volume then connect rate. The System / Unassigned
-  bucket is shown separately at the bottom.
-- **IB Dispositions** — connectivity summary (connected share of dispositioned
-  calls), the full disposition distribution, and breakdowns by class
-  (Connected vs Not), by party (RPC / TPC) and by outcome.
+Four new tabs in each report — the same pair for each stream:
+- **OB Agents** / **IB Agents** — one row per named agent: calls handled,
+  connected, connect rate, PTP / Payment / No-PTP counts, average talk time and
+  their most common disposition, ranked by volume then connect rate. The System /
+  Unassigned bucket is shown separately at the bottom.
+- **OB Dispositions** / **IB Dispositions** — connectivity summary (connected
+  share of dispositioned calls), the full disposition distribution, and
+  breakdowns by class (Connected vs Not), by party (RPC / TPC) and by outcome.
+
+The Leadership View hub gains an **agents & dispositions** callout for each
+stream (connected-disp rate, top / lowest agent, most common disposition).
 
 Trends (from the second weekly/monthly period on):
-- The **Trends** tab gains a **per-disposition** move table (share of
-  dispositioned calls, Prior % → Current % → Δ, biggest shifts first) and a
-  **per-agent** move table (connect rate Prior → Current → Δ, who went up / down).
+- The **Trends** tab gains, **for each stream**, a **per-disposition** move table
+  (share of dispositioned calls, Prior % → Current % → Δ, biggest shifts first)
+  and a **per-agent** move table (connect rate Prior → Current → Δ, who went up /
+  down).
 
-Alerts (tuned in `config.py → ALERTS`):
+Alerts (tuned in `config.py → ALERTS`; evaluated for **both** streams, tagged OB / IB):
 - `connected_disp_drop_pts` (default 5) — 🟠 WARN if the connected (C-*) share of
   dispositioned calls falls by that many points.
 - `agent_connect_move_pts` (default 8) — flags any agent whose connect rate moves

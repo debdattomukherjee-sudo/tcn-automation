@@ -179,10 +179,10 @@ def _metric_rows(metrics, prior, cur):
     return rows
 
 
-def _disposition_moves(prior, cur):
-    """WoW/MoM movement per inbound disposition code (share of dispositioned
-    calls). Ordered by absolute share move (biggest shifts first)."""
-    pib, cib = (prior or {}).get("ib"), (cur or {}).get("ib")
+def _disposition_moves(prior, cur, stream="ib"):
+    """WoW/MoM movement per disposition code (share of dispositioned
+    calls) for the given stream. Ordered by absolute share move (biggest first)."""
+    pib, cib = (prior or {}).get(stream), (cur or {}).get(stream)
     if not pib or not cib:
         return []
     pmap, cmap = pib.get("dispositions") or {}, cib.get("dispositions") or {}
@@ -204,10 +204,10 @@ def _disposition_moves(prior, cur):
     return rows
 
 
-def _agent_moves(prior, cur):
-    """WoW/MoM movement per agent (connect rate + volume). Ordered by absolute
-    connect-rate move."""
-    pib, cib = (prior or {}).get("ib"), (cur or {}).get("ib")
+def _agent_moves(prior, cur, stream="ib"):
+    """WoW/MoM movement per agent (connect rate + volume) for the given stream.
+    Ordered by absolute connect-rate move."""
+    pib, cib = (prior or {}).get(stream), (cur or {}).get(stream)
     if not pib or not cib:
         return []
     pmap, cmap = pib.get("agents") or {}, cib.get("agents") or {}
@@ -238,8 +238,10 @@ def _block(basis, prior, cur):
              "current_label": cur.get("date_label", "current"),
              "ob": _metric_rows(OB_METRICS, prior, cur),
              "ib": _metric_rows(IB_METRICS, prior, cur),
-             "ib_disp": _disposition_moves(prior, cur),
-             "ib_agents": _agent_moves(prior, cur),
+             "ib_disp": _disposition_moves(prior, cur, "ib"),
+             "ib_agents": _agent_moves(prior, cur, "ib"),
+             "ob_disp": _disposition_moves(prior, cur, "ob"),
+             "ob_agents": _agent_moves(prior, cur, "ob"),
              "best_window_shift": None}
     pob, cob = prior.get("ob"), cur.get("ob")
     if pob and cob:

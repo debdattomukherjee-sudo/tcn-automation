@@ -55,6 +55,14 @@ OB_COLS = {
     "delivery_cost":  ["Delivery Cost"],
     "linkback_cost":  ["Linkback Cost"],
     "total_cost":     ["Total Cost"],
+    # agent + disposition columns (added to the OB dump from 2026-06-29 on; the
+    # same layer we already run for inbound — analysis is no-op if absent)
+    "talk_dur":       ["Agent Call Talk Duration"],
+    "hold_dur":       ["Agent Call Hold Duration"],
+    "wrap_dur":       ["Agent Call Wrap up Duration"],
+    "agent_first":    ["Agent First Name"],
+    "agent_last":     ["Agent Last Name"],
+    "disposition":    ["An Agent Call Response", "Agent Call Response"],
 }
 IB_COLS = {
     "timestamp":      ["Call Date-Time", "Start Time"],
@@ -455,6 +463,10 @@ def analyze_ob(ob):
         res["cost_wasted"] = float(tc.sum()) - cost_on_al
         res["cost_per_connect_est"] = cost_per_connect_by_bucket(
             res["cost_by_est"], res["est_al"])
+    # agent + disposition layer (Col K/L + "An Agent Call Response"), same as IB.
+    # Connected (C-*) here is the agent-response classification, independent of
+    # the outbound "Answered Linkcall" connectivity above.
+    res["agentdisp"] = analyze_ib_agents(ob, m)
     res["_df"] = ob          # kept for the live-formula raw-data sheet
     return res
 
@@ -686,7 +698,7 @@ def _prep_raw(df, meta, stream):
     res = d[meta["result"]]
     conn = (res == OB_ANSWERED_LINKCALL) if stream == "OB" else res.isin(IB_CONNECTED_RESULTS)
     d[H_ISCONNECT] = ["Yes" if b else "No" for b in conn]
-    if stream == "IB" and meta.get("disposition"):
+    if meta.get("disposition"):
         parsed = d[meta["disposition"]].apply(parse_disposition)
         an = agent_name_series(d, meta)
         d[H_AGENT] = an if an is not None else AGENT_BLANK_LABEL
@@ -1200,11 +1212,11 @@ def _disp_delta_str(d):
     return f"{arrow} {sign}{abs(d) * 100:.1f} pts"
 
 
-def _write_disp_trend(sh, moves):
+def _write_disp_trend(sh, moves, label="Inbound"):
     """Disposition-mix movement table (share of dispositioned calls)."""
     if not moves:
         return
-    sh.section("Inbound — disposition mix movement (share of dispositioned calls)")
+    sh.section(f"{label} — disposition mix movement (share of dispositioned calls)")
     rows = []
     for m in moves[:12]:
         tag = "  (new)" if m["is_new"] else ("  (gone)" if m["is_gone"] else "")
@@ -1216,14 +1228,14 @@ def _write_disp_trend(sh, moves):
              widths=[26, 12, 12, 14, 12, 13])
 
 
-def _write_agent_trend(sh, moves):
+def _write_agent_trend(sh, moves, label="Inbound"):
     """Per-agent connect-rate movement table (who went up / down)."""
     if not moves:
         return
     elig = [m for m in moves if m["rate_delta"] is not None]
     if not elig:
         return
-    sh.section("Inbound — agent connect-rate movement")
+    sh.section(f"{label} — agent connect-rate movement")
     rows = []
     for m in elig[:15]:
         rows.append([m["agent"], m["prior_rate"], m["current_rate"],
@@ -1250,8 +1262,10 @@ def write_trends_tab(wb, client, comparisons):
             pw, cw = blk["best_window_shift"]
             sh.kv("Best calling window shifted", f"{pw}  →  {cw}",
                   color=AMBER, bold_val=True)
-        _write_disp_trend(sh, blk.get("ib_disp"))
-        _write_agent_trend(sh, blk.get("ib_agents"))
+        _write_disp_trend(sh, blk.get("ob_disp"), label="Outbound")
+        _write_agent_trend(sh, blk.get("ob_agents"), label="Outbound")
+        _write_disp_trend(sh, blk.get("ib_disp"), label="Inbound")
+        _write_agent_trend(sh, blk.get("ib_agents"), label="Inbound")
         sh.blank()
 
 
@@ -1281,20 +1295,21 @@ def write_leadership_movement(sh, comparisons):
     sh.blank()
 
 
-def write_ib_disposition_tabs(wb, ad, raw, talk_h=None):
+def write_ib_disposition_tabs(wb, ad, raw, talk_h=None, prefix="IB", label="Inbound"):
     """Two current-period drill-down tabs from the agent-disposition layer:
-    'IB Agents' (per-agent performance) and 'IB Dispositions' (response-code
-    distribution + class/party/outcome rollups). All numbers are live
-    COUNTIFS/AVERAGEIFS formulas over the embedded IB_RawData sheet. No-op when
-    the dump has no disposition column. `talk_h` = the dump's talk-duration
-    column name (for live AVERAGEIFS), or None to fall back to the computed avg."""
+    '<prefix> Agents' (per-agent performance) and '<prefix> Dispositions'
+    (response-code distribution + class/party/outcome rollups). All numbers are
+    live COUNTIFS/AVERAGEIFS formulas over the embedded <prefix>_RawData sheet.
+    No-op when the dump has no disposition column. `talk_h` = the dump's
+    talk-duration column name (for live AVERAGEIFS), or None to fall back to the
+    computed avg. Used for both inbound and outbound."""
     if not ad:
         return
     has_talk = bool(talk_h) and raw.has(talk_h)
-    # ---------------------------- IB Agents ---------------------------- #
-    ws = wb.create_sheet("IB Agents"); ws.sheet_view.showGridLines = False
+    # --------------------------- <prefix> Agents --------------------------- #
+    ws = wb.create_sheet(f"{prefix} Agents"); ws.sheet_view.showGridLines = False
     sh = Sheet(ws)
-    sh.title("Inbound — Agent Performance",
+    sh.title(f"{label} — Agent Performance",
              "Per-agent outcomes on agent-handled calls. Connect = response "
              "code starts C-. Ranked by calls handled.")
     agents = ad["agents"]
@@ -1337,10 +1352,10 @@ def write_ib_disposition_tabs(wb, ad, raw, talk_h=None):
               EQ(raw.countif(H_AGENT, _q(AGENT_BLANK_LABEL))),
               "#,##0", color=GREY, bold_val=True)
 
-    # ------------------------- IB Dispositions ------------------------- #
-    ws = wb.create_sheet("IB Dispositions"); ws.sheet_view.showGridLines = False
+    # ----------------------- <prefix> Dispositions ----------------------- #
+    ws = wb.create_sheet(f"{prefix} Dispositions"); ws.sheet_view.showGridLines = False
     sh = Sheet(ws)
-    sh.title("Inbound — Agent Dispositions",
+    sh.title(f"{label} — Agent Dispositions",
              "'An Agent Call Response' breakdown. Codes parse as "
              "class (C/NC) · party (RPC/TPC) · outcome.")
     sh.section("Connectivity (of dispositioned calls)")
@@ -1581,6 +1596,32 @@ def build_workbook(client, period, date_label, ob_res, ib_res, out_path,
                       ob_res["cost_wasted"], '$#,##0.000', color=RED)
             sh.blank()
 
+        oad = ob_res.get("agentdisp")
+        if oad and (oad.get("agents") or len(oad.get("disp_counts", []))):
+            sh.section("Outbound — agents & dispositions")
+            sh.kv("Connected (C-*) rate of dispositioned dials",
+                  EQ(IFERR(f"{ob_raw.countif(H_DISP_CONN, _q('Yes'))}/"
+                           f"{ob_raw.countif(H_HASDISP, _q('Yes'))}", "0")),
+                  "0.0%", color=GREEN, bold_val=True)
+            if oad["agents"]:
+                ranked = [a for a in oad["agents"] if a["handled"] >= 5] or oad["agents"]
+                top = max(ranked, key=lambda a: a["rate"])
+                low = min(ranked, key=lambda a: a["rate"])
+                sh.kv("Top agent (connect rate, ≥5 dials)",
+                      f"{top['agent']} — {top['rate']:.1%} ({top['handled']:,} dials)",
+                      color=GREEN)
+                if low["agent"] != top["agent"]:
+                    sh.kv("Lowest agent (connect rate, ≥5 dials)",
+                          f"{low['agent']} — {low['rate']:.1%} ({low['handled']:,} dials)",
+                          color=RED)
+                sh.kv("Named agents handling dials", oad["n_agents"], "#,##0")
+            if len(oad["disp_counts"]):
+                tc = oad["disp_counts"]
+                sh.kv("Most common disposition",
+                      f"{tc.index[0]} — {int(tc.iloc[0]):,} "
+                      f"({tc.iloc[0] / oad['disp_total']:.0%})")
+            sh.blank()
+
     if ib_res:
         sh.section("Inbound — the bottom line")
         vr = sh.r + 1
@@ -1646,6 +1687,10 @@ def build_workbook(client, period, date_label, ob_res, ib_res, out_path,
             sh.note("• OB Heatmap — weekday × time-of-day connect-rate grid (your scheduling map)")
         sh.note("• OB Outcomes & Waste — every non-connect outcome by window")
         sh.note("• OB Cost — cost per connect, cheapest windows, connected vs wasted spend")
+        if ob_res.get("agentdisp") and (ob_res["agentdisp"].get("agents")
+                                        or len(ob_res["agentdisp"].get("disp_counts", []))):
+            sh.note("• OB Agents — per-agent connect rate, PTP/payment, talk time (ranked)")
+            sh.note("• OB Dispositions — agent-response breakdown by class / party / outcome")
         if period == "weekly":
             sh.note("• OB Day of Week")
         if period == "monthly":
@@ -1779,6 +1824,10 @@ def build_workbook(client, period, date_label, ob_res, ib_res, out_path,
                 sh.table(["Result", "Total Cost ($)"], rows, money_cols=(2,),
                          widths=[26, 18], total_row=True)
 
+        write_ib_disposition_tabs(wb, ob_res.get("agentdisp"), ob_raw,
+                                  talk_h=ob_meta.get("talk_dur"),
+                                  prefix="OB", label="Outbound")
+
         _stream_period_tabs(wb, "OB", ob_res, period, "Answered Linkcalls", ob_raw)
 
     # ----- IB detail tabs ----- #
@@ -1873,6 +1922,18 @@ def client_metrics(client, period, date_label, ob_res, ib_res, drive_link=None,
             "best_window": peaks[0][0] if peaks else None,
             "best_window_rate": peaks[0][3] if peaks else None,
         }
+        oad = ob_res.get("agentdisp")
+        if oad:
+            rec["ob"]["disp_total"] = oad["disp_total"]
+            rec["ob"]["disp_connected"] = oad["disp_connected"]
+            rec["ob"]["disp_connected_rate"] = oad["disp_connected_rate"]
+            rec["ob"]["dispositions"] = {str(k): int(v)
+                                         for k, v in oad["disp_counts"].items()}
+            rec["ob"]["agents"] = {
+                r["agent"]: {"handled": r["handled"], "connected": r["connected"],
+                             "rate": r["rate"], "ptp": r["ptp"],
+                             "payment": r["payment"], "avg_talk": r["avg_talk"]}
+                for r in oad["agents"]}
     if ib_res:
         mb = best_bucket(ib_res.get("miss_est"))
         rec["ib"] = {
