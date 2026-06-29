@@ -179,12 +179,67 @@ def _metric_rows(metrics, prior, cur):
     return rows
 
 
+def _disposition_moves(prior, cur):
+    """WoW/MoM movement per inbound disposition code (share of dispositioned
+    calls). Ordered by absolute share move (biggest shifts first)."""
+    pib, cib = (prior or {}).get("ib"), (cur or {}).get("ib")
+    if not pib or not cib:
+        return []
+    pmap, cmap = pib.get("dispositions") or {}, cib.get("dispositions") or {}
+    if not pmap and not cmap:
+        return []
+    ptot = pib.get("disp_total") or sum(pmap.values())
+    ctot = cib.get("disp_total") or sum(cmap.values())
+    rows = []
+    for k in sorted(set(pmap) | set(cmap)):
+        pc, cc = pmap.get(k, 0), cmap.get(k, 0)
+        ps = (pc / ptot) if ptot else 0.0
+        cs = (cc / ctot) if ctot else 0.0
+        d = cs - ps
+        rows.append({"code": k, "prior_count": pc, "current_count": cc,
+                     "prior_share": ps, "current_share": cs, "share_delta": d,
+                     "arrow": "▲" if d > 1e-9 else ("▼" if d < -1e-9 else "▬"),
+                     "is_new": pc == 0 and cc > 0, "is_gone": cc == 0 and pc > 0})
+    rows.sort(key=lambda r: -abs(r["share_delta"]))
+    return rows
+
+
+def _agent_moves(prior, cur):
+    """WoW/MoM movement per agent (connect rate + volume). Ordered by absolute
+    connect-rate move."""
+    pib, cib = (prior or {}).get("ib"), (cur or {}).get("ib")
+    if not pib or not cib:
+        return []
+    pmap, cmap = pib.get("agents") or {}, cib.get("agents") or {}
+    if not pmap and not cmap:
+        return []
+    rows = []
+    for k in sorted(set(pmap) | set(cmap)):
+        pa, ca = pmap.get(k), cmap.get(k)
+        pr = pa.get("rate") if pa else None
+        cr = ca.get("rate") if ca else None
+        rd = (cr - pr) if (pr is not None and cr is not None) else None
+        rows.append({"agent": k, "prior_rate": pr, "current_rate": cr,
+                     "rate_delta": rd,
+                     "prior_handled": (pa.get("handled") if pa else 0),
+                     "current_handled": (ca.get("handled") if ca else 0),
+                     "arrow": ("▲" if (rd or 0) > 1e-9 else
+                               ("▼" if (rd or 0) < -1e-9 else "▬")),
+                     "is_new": pa is None and ca is not None,
+                     "is_gone": ca is None and pa is not None})
+    rows.sort(key=lambda r: -(abs(r["rate_delta"])
+                              if r["rate_delta"] is not None else -1))
+    return rows
+
+
 def _block(basis, prior, cur):
     block = {"basis": basis,
              "prior_label": prior.get("date_label", "prior"),
              "current_label": cur.get("date_label", "current"),
              "ob": _metric_rows(OB_METRICS, prior, cur),
              "ib": _metric_rows(IB_METRICS, prior, cur),
+             "ib_disp": _disposition_moves(prior, cur),
+             "ib_agents": _agent_moves(prior, cur),
              "best_window_shift": None}
     pob, cob = prior.get("ob"), cur.get("ob")
     if pob and cob:

@@ -355,6 +355,85 @@ def _data_quality(rec, cfg):
 # --------------------------------------------------------------------------- #
 # Public: per-client evaluation                                                #
 # --------------------------------------------------------------------------- #
+def _disposition_alerts(blk, basis, cfg):
+    """Movement in the inbound agent-disposition mix (Col S 'An Agent Call
+    Response'). Headline = connected (C-*) share drop; plus any single
+    disposition whose share moved past the threshold."""
+    out = []
+    moves = (blk or {}).get("ib_disp") or []
+    if not moves:
+        return out
+    # headline: connected (C-*) share of dispositioned calls dropping
+    pc = sum(m["prior_share"] for m in moves if str(m["code"]).startswith("C-"))
+    cc = sum(m["current_share"] for m in moves if str(m["code"]).startswith("C-"))
+    drop = (pc - cc) * 100
+    if drop >= cfg.get("connected_disp_drop_pts", 5.0):
+        out.append(_a("ib_connected_disp_drop", "WARN", "IB",
+                      "Connected dispositions", basis,
+                      f"Connected (C-*) share of agent dispositions fell "
+                      f"{drop:.1f} pts {basis} ({pc * 100:.1f}% → {cc * 100:.1f}%)",
+                      prior=pc, current=cc, kind="rate", change_str=_pts(cc - pc)))
+    # individual disposition shifts
+    shift = cfg.get("disposition_shift_pts", 5.0) / 100.0
+    cap = int(cfg.get("disposition_max_alerts", 6) or 0)
+    n = 0
+    for m in moves:
+        if abs(m["share_delta"]) < shift:
+            continue
+        if cap and n >= cap:
+            break
+        n += 1
+        if m["is_new"]:
+            verb = "appeared"
+        elif m["is_gone"]:
+            verb = "disappeared"
+        else:
+            verb = "up" if m["share_delta"] > 0 else "down"
+        out.append(_a(f"disp_shift::{m['code']}", "INFO", "IB",
+                      f"Disp {m['code']}", basis,
+                      f"Disposition {m['code']} {verb} {basis}: "
+                      f"{m['prior_share'] * 100:.1f}% → {m['current_share'] * 100:.1f}% "
+                      f"({m['prior_count']:,} → {m['current_count']:,} calls)",
+                      prior=m["prior_share"], current=m["current_share"],
+                      kind="rate", change_str=_pts(m["share_delta"])))
+    return out
+
+
+def _agent_alerts(blk, basis, cfg):
+    """Per-agent connect-rate movement (Col K/L). Eligible agents must handle
+    >= agent_min_calls in BOTH periods. Drop = WARN, rise = INFO."""
+    out = []
+    moves = (blk or {}).get("ib_agents") or []
+    if not moves:
+        return out
+    move_thr = cfg.get("agent_connect_move_pts", 8.0) / 100.0
+    min_calls = int(cfg.get("agent_min_calls", 20) or 0)
+    cap = int(cfg.get("agent_max_alerts", 5) or 0)
+    n = 0
+    for m in moves:
+        if m["rate_delta"] is None:
+            continue
+        if min_calls and (m["prior_handled"] < min_calls
+                          or m["current_handled"] < min_calls):
+            continue
+        if abs(m["rate_delta"]) < move_thr:
+            continue
+        if cap and n >= cap:
+            break
+        n += 1
+        d = m["rate_delta"] * 100
+        sev = "WARN" if d < 0 else "INFO"
+        direction = "up" if d > 0 else "down"
+        out.append(_a(f"agent_move::{m['agent']}", sev, "IB",
+                      f"Agent {m['agent']}", basis,
+                      f"Agent {m['agent']} connect rate {direction} {abs(d):.1f} pts "
+                      f"{basis} ({m['prior_rate'] * 100:.1f}% → "
+                      f"{m['current_rate'] * 100:.1f}%, {m['current_handled']:,} calls)",
+                      prior=m["prior_rate"], current=m["current_rate"],
+                      kind="rate", change_str=_pts(m["rate_delta"])))
+    return out
+
+
 def evaluate(rec, comparisons, hist, cfg=None, targets=None):
     cfg = cfg if cfg is not None else _cfg()
     if not cfg.get("enabled", True):
@@ -368,6 +447,8 @@ def evaluate(rec, comparisons, hist, cfg=None, targets=None):
     if blk:
         alerts += _delta_alerts(blk, basis, cfg)
         alerts += _window_drift_alert(blk, cfg)
+        alerts += _disposition_alerts(blk, basis, cfg)
+        alerts += _agent_alerts(blk, basis, cfg)
     alerts += _level_alerts(rec, cfg)
     alerts += _streak_alert(rec, hist, cfg)
     alerts += _baseline_alert(rec, hist, cfg)

@@ -97,6 +97,18 @@ ALERTS = {
     "data_quality_checks": True,        # bad values, zero-dial-with-spend, missing stream
     "expect_missing_file_alert": False, # WARN a client produced no file this run (opt-in)
 
+    # Inbound agent-disposition + per-agent movement (Col K/L/S)
+    "disposition_shift_pts": 5.0,       # flag a disposition whose share of
+                                        #   dispositioned calls moves >= 5 pts
+    "connected_disp_drop_pts": 5.0,     # WARN if connected (C-*) rate among
+                                        #   dispositioned calls drops >= 5 pts
+    "agent_connect_move_pts": 8.0,      # flag an agent whose connect rate moves
+                                        #   >= 8 pts (drop = WARN, rise = INFO)
+    "agent_min_calls": 20,              # agent must handle >= this many calls in
+                                        #   BOTH periods to be eligible (anti-noise)
+    "agent_max_alerts": 5,              # cap per-agent alerts per run
+    "disposition_max_alerts": 6,        # cap per-disposition alerts per run
+
     # Slack digest: minimum severity to include ("INFO" | "WARN" | "CRITICAL")
     "slack_min_severity": "INFO",
 }

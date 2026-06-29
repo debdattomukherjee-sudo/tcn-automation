@@ -213,6 +213,49 @@ Tuning thresholds lives in **`config.py`**:
 
 ---
 
+## Inbound agents & dispositions (automatic — no setup)
+The inbound dump carries three columns the older reports ignored: **Agent First
+Name** (Col K), **Agent Last Name** (Col L) and **An Agent Call Response** (Col
+S, the disposition). The engine now reads all three and adds a full agent +
+disposition layer on the same Analysis → drill-down → trends → alerts pattern as
+everything else.
+
+Disposition codes are read as structured `class-party-outcome` (e.g.
+`C-RPC-PTP` = **C**onnected, **R**ight-**P**arty **C**ontact, **P**romise To
+Pay). Anything starting with `C-` counts as **connected**. Rows with no agent
+name are system calls (abandoned / voicemail / hang-up before pickup) — they're
+bucketed as **"System / Unassigned"** and kept out of the per-agent rankings.
+
+Two new tabs in each report:
+- **IB Agents** — one row per named agent: calls handled, connected, connect
+  rate, PTP / Payment / No-PTP counts, average talk time and their most common
+  disposition, ranked by volume then connect rate. The System / Unassigned
+  bucket is shown separately at the bottom.
+- **IB Dispositions** — connectivity summary (connected share of dispositioned
+  calls), the full disposition distribution, and breakdowns by class
+  (Connected vs Not), by party (RPC / TPC) and by outcome.
+
+Trends (from the second weekly/monthly period on):
+- The **Trends** tab gains a **per-disposition** move table (share of
+  dispositioned calls, Prior % → Current % → Δ, biggest shifts first) and a
+  **per-agent** move table (connect rate Prior → Current → Δ, who went up / down).
+
+Alerts (tuned in `config.py → ALERTS`):
+- `connected_disp_drop_pts` (default 5) — 🟠 WARN if the connected (C-*) share of
+  dispositioned calls falls by that many points.
+- `agent_connect_move_pts` (default 8) — flags any agent whose connect rate moves
+  that far: a **drop** is 🟠 WARN, a **rise** is 🔵 INFO. Guarded by
+  `agent_min_calls` (default 20 in **both** periods, anti-noise) and capped at
+  `agent_max_alerts`.
+- `disposition_shift_pts` (default 5) — 🔵 INFO per disposition whose share moves
+  that far, capped at `disposition_max_alerts`.
+
+The first weekly dump has nothing to compare against, so you'll see the new tabs
+populated but no agent/disposition trend or alert rows yet — those fill in on the
+second weekly run automatically.
+
+---
+
 ## Run it automatically every day (macOS scheduling)
 So you never have to run `run.py` by hand, install it as a daily LaunchAgent:
 ```

@@ -67,11 +67,68 @@ IB_COLS = {
     "talk_dur":       ["Agent Call Talk Duration"],
     "hold_dur":       ["Agent Call Hold Duration"],
     "wrap_dur":       ["Agent Call Wrap up Duration"],
+    "agent_first":    ["Agent First Name"],
+    "agent_last":     ["Agent Last Name"],
+    "disposition":    ["An Agent Call Response", "Agent Call Response"],
 }
 
 # Business definitions (kept as data, not hard rules in code, so they're visible)
 OB_ANSWERED_LINKCALL = "Answered Linkcall"
 IB_CONNECTED_RESULTS = ["Answered Linkcall", "Answered"]   # IB "connectivity"
+
+# Inbound agent-disposition ("An Agent Call Response") taxonomy. The codes are
+# structured hyphen-segments: <contact-class>-<party>-<outcome...>, e.g.
+#   C-RPC-PTP        -> Connected, Right-Party Contact, Promise To Pay
+#   C-RPC-DNC-NU     -> Connected, Right-Party, Do-Not-Call / Not Usable
+#   C-TPC-WRONG      -> Connected, Third-Party, Wrong number
+#   NC-DISCONNECT    -> Not Connected, disconnected
+# We parse the segments so drill-downs (by contact class / party / outcome) come
+# for free without hard-coding the full code list. "Connected" = code starts C-.
+AGENT_BLANK_LABEL = "System / Unassigned"
+DISP_CLASS = {"C": "Connected", "NC": "Not Connected"}
+DISP_PARTY = {"RPC": "Right Party (RPC)", "TPC": "Third Party (TPC)"}
+
+
+def parse_disposition(code):
+    """Split an agent-response code into (class, party, outcome) labels.
+    Returns a dict; unknown/blank codes degrade gracefully."""
+    raw = "" if code is None else str(code).strip()
+    if not raw or raw.lower() in ("nan", "na", "none"):
+        return {"raw": None, "class": None, "party": None, "outcome": None,
+                "connected": None}
+    segs = [s for s in raw.split("-") if s != ""]
+    cls = DISP_CLASS.get(segs[0], segs[0]) if segs else None
+    connected = (segs[0] == "C") if segs else None
+    party, outcome = None, None
+    if len(segs) >= 2:
+        if segs[1] in DISP_PARTY:
+            party = DISP_PARTY[segs[1]]
+            outcome = "-".join(segs[2:]) or None
+        else:
+            outcome = "-".join(segs[1:]) or None
+    return {"raw": raw, "class": cls, "party": party, "outcome": outcome,
+            "connected": connected}
+
+
+def agent_name_series(df, m):
+    """Combined 'First Last' agent name per row; blanks -> AGENT_BLANK_LABEL."""
+    fcol, lcol = m.get("agent_first"), m.get("agent_last")
+    if not fcol and not lcol:
+        return None
+    first = df[fcol].astype(str) if fcol else ""
+    last = df[lcol].astype(str) if lcol else ""
+
+    def _clean(s):
+        s = "" if s is None else str(s).strip()
+        return "" if s.lower() in ("nan", "none", "na") else s
+
+    names = []
+    for fi, la in zip(
+            (first if fcol else [""] * len(df)),
+            (last if lcol else [""] * len(df))):
+        full = (f"{_clean(fi)} {_clean(la)}").strip()
+        names.append(full if full else AGENT_BLANK_LABEL)
+    return pd.Series(names, index=df.index)
 
 # --------------------------------------------------------------------------- #
 # Styling                                                                      #
@@ -401,6 +458,84 @@ def analyze_ob(ob):
     return res
 
 
+def analyze_ib_agents(ib, m):
+    """Agent-disposition analytics for inbound. Returns None when the dump has
+    no disposition column at all. Builds:
+      - disposition distribution (raw codes) + class/party/outcome rollups
+      - per-agent table (handled, connected, connect-rate, PTP, payment, talk)
+    Connected = response code starts with 'C-'. Blank-agent rows (abandoned /
+    voicemail / not connected) are kept in totals under AGENT_BLANK_LABEL but
+    excluded from the per-agent ranking."""
+    if not m.get("disposition"):
+        return None
+    disp_raw = ib[m["disposition"]]
+    parsed = disp_raw.apply(parse_disposition)
+    has_disp = parsed.apply(lambda p: p["raw"] is not None)
+    if not bool(has_disp.any()):
+        return None
+
+    agents = agent_name_series(ib, m)
+    talk = (pd.to_numeric(ib[m["talk_dur"]], errors="coerce")
+            if m.get("talk_dur") else pd.Series([None] * len(ib), index=ib.index))
+
+    w = pd.DataFrame({
+        "agent": agents if agents is not None else AGENT_BLANK_LABEL,
+        "raw": parsed.apply(lambda p: p["raw"]),
+        "cls": parsed.apply(lambda p: p["class"]),
+        "party": parsed.apply(lambda p: p["party"]),
+        "outcome": parsed.apply(lambda p: p["outcome"]),
+        "connected": parsed.apply(lambda p: p["connected"]),
+        "talk": talk,
+    })
+    d = w[has_disp.values].copy()           # only dispositioned rows
+    disp_total = int(len(d))
+    disp_counts = d["raw"].value_counts()
+    disp_connected = int((d["connected"] == True).sum())  # noqa: E712
+
+    def _counts(col):
+        return d[col].dropna().value_counts()
+
+    res = {
+        "disp_total": disp_total,
+        "disp_counts": disp_counts,
+        "disp_connected": disp_connected,
+        "disp_connected_rate": pct(disp_connected, disp_total),
+        "by_class": _counts("cls"),
+        "by_party": _counts("party"),
+        "by_outcome": _counts("outcome"),
+    }
+
+    # ---- per-agent table (exclude the blank/system bucket from ranking) ----
+    agent_rows = []
+    for name, g in d.groupby("agent"):
+        handled = int(len(g))
+        conn = int((g["connected"] == True).sum())  # noqa: E712
+        out = g["outcome"]
+        ptp = int((out == "PTP").sum())
+        payment = int((out == "PAYMENT").sum())
+        no_ptp = int((out == "NO_PTP").sum())
+        tk = pd.to_numeric(g["talk"], errors="coerce").dropna()
+        top = g["raw"].value_counts()
+        agent_rows.append({
+            "agent": name, "handled": handled, "connected": conn,
+            "rate": pct(conn, handled), "ptp": ptp, "payment": payment,
+            "no_ptp": no_ptp,
+            "avg_talk": float(tk.mean()) if len(tk) else 0.0,
+            "top_disp": top.index[0] if len(top) else "—",
+        })
+    ranked = sorted([r for r in agent_rows if r["agent"] != AGENT_BLANK_LABEL],
+                    key=lambda r: (-r["handled"], -r["rate"]))
+    # System / Unassigned = all rows with no agent name (abandoned, voicemail,
+    # not connected). These carry no disposition, so they come from the FULL
+    # frame, not the dispositioned subset.
+    blank_handled = int((w["agent"] == AGENT_BLANK_LABEL).sum())
+    res["agents"] = ranked
+    res["agent_blank"] = ({"agent": AGENT_BLANK_LABEL, "handled": blank_handled}
+                          if blank_handled else None)
+    res["n_agents"] = len(ranked)
+    return res
+
+
 def analyze_ib(ib):
     m = ib.attrs["meta"]
     total = len(ib)
@@ -436,6 +571,8 @@ def analyze_ib(ib):
         td = pd.to_numeric(ib[m["talk_dur"]], errors="coerce").dropna()
         res["avg_talk"] = float(td.mean()) if len(td) else 0.0
         res["total_talk"] = float(td.sum()) if len(td) else 0.0
+    # agent + disposition layer (Col K/L + "An Agent Call Response")
+    res["agentdisp"] = analyze_ib_agents(ib, m)
     return res
 
 
@@ -865,6 +1002,47 @@ def _write_trend_table(sh, stream_label, rows):
     sh.r += 1
 
 
+def _disp_delta_str(d):
+    sign = "+" if d > 1e-9 else ("−" if d < -1e-9 else "")
+    arrow = "▲" if d > 1e-9 else ("▼" if d < -1e-9 else "▬")
+    return f"{arrow} {sign}{abs(d) * 100:.1f} pts"
+
+
+def _write_disp_trend(sh, moves):
+    """Disposition-mix movement table (share of dispositioned calls)."""
+    if not moves:
+        return
+    sh.section("Inbound — disposition mix movement (share of dispositioned calls)")
+    rows = []
+    for m in moves[:12]:
+        tag = "  (new)" if m["is_new"] else ("  (gone)" if m["is_gone"] else "")
+        rows.append([f"{m['code']}{tag}", m["prior_share"], m["current_share"],
+                     _disp_delta_str(m["share_delta"]),
+                     m["prior_count"], m["current_count"]])
+    sh.table(["Disposition", "Prior %", "Current %", "Δ", "Prior calls", "Current calls"],
+             rows, pct_cols=(2, 3), num_cols=(5, 6),
+             widths=[26, 12, 12, 14, 12, 13])
+
+
+def _write_agent_trend(sh, moves):
+    """Per-agent connect-rate movement table (who went up / down)."""
+    if not moves:
+        return
+    elig = [m for m in moves if m["rate_delta"] is not None]
+    if not elig:
+        return
+    sh.section("Inbound — agent connect-rate movement")
+    rows = []
+    for m in elig[:15]:
+        rows.append([m["agent"], m["prior_rate"], m["current_rate"],
+                     _disp_delta_str(m["rate_delta"]),
+                     m["prior_handled"], m["current_handled"]])
+    sh.table(["Agent", "Prior connect %", "Current connect %", "Δ",
+              "Prior calls", "Current calls"],
+             rows, pct_cols=(2, 3), num_cols=(5, 6),
+             widths=[22, 15, 16, 14, 12, 13])
+
+
 def write_trends_tab(wb, client, comparisons):
     """Standalone Trends tab: one section per comparison basis (WoW/MoM/DoD)."""
     ws = wb.create_sheet("Trends"); ws.sheet_view.showGridLines = False
@@ -880,6 +1058,8 @@ def write_trends_tab(wb, client, comparisons):
             pw, cw = blk["best_window_shift"]
             sh.kv("Best calling window shifted", f"{pw}  →  {cw}",
                   color=AMBER, bold_val=True)
+        _write_disp_trend(sh, blk.get("ib_disp"))
+        _write_agent_trend(sh, blk.get("ib_agents"))
         sh.blank()
 
 
@@ -907,6 +1087,67 @@ def write_leadership_movement(sh, comparisons):
     if len(comparisons) > 1:
         sh.note(f"Also compared: {comparisons[1]['basis']} — full detail on the Trends tab.")
     sh.blank()
+
+
+def write_ib_disposition_tabs(wb, ad):
+    """Two current-period drill-down tabs from the agent-disposition layer:
+    'IB Agents' (per-agent performance) and 'IB Dispositions' (response-code
+    distribution + class/party/outcome rollups). No-op when the dump has no
+    disposition column."""
+    if not ad:
+        return
+    # ---------------------------- IB Agents ---------------------------- #
+    ws = wb.create_sheet("IB Agents"); ws.sheet_view.showGridLines = False
+    sh = Sheet(ws)
+    sh.title("Inbound — Agent Performance",
+             "Per-agent outcomes on agent-handled calls. Connect = response "
+             "code starts C-. Ranked by calls handled.")
+    rows = [[r["agent"], r["handled"], r["connected"], r["rate"], r["ptp"],
+             r["payment"], round(r["avg_talk"], 1), r["top_disp"]]
+            for r in ad["agents"]]
+    if rows:
+        sh.section(f"Agents ranked by calls handled ({ad['n_agents']} agent(s))")
+        sh.table(["Agent", "Handled", "Connected", "Connect %", "PTP",
+                  "Payment", "Avg talk (s)", "Top disposition"], rows,
+                 pct_cols=(4,), num_cols=(2, 3, 5, 6, 7),
+                 widths=[22, 10, 11, 11, 8, 9, 13, 24])
+    else:
+        sh.section("No named agents this period")
+        sh.note("Every inbound call this period was system-handled "
+                "(abandoned / voicemail / not connected).")
+    if ad.get("agent_blank"):
+        b = ad["agent_blank"]
+        sh.blank()
+        sh.section("System / Unassigned (not agent-handled)")
+        sh.kv("Calls (abandoned / voicemail / not connected)",
+              b["handled"], "#,##0", color=GREY, bold_val=True)
+
+    # ------------------------- IB Dispositions ------------------------- #
+    ws = wb.create_sheet("IB Dispositions"); ws.sheet_view.showGridLines = False
+    sh = Sheet(ws)
+    sh.title("Inbound — Agent Dispositions",
+             "'An Agent Call Response' breakdown. Codes parse as "
+             "class (C/NC) · party (RPC/TPC) · outcome.")
+    tot = ad["disp_total"]
+    sh.section("Connectivity (of dispositioned calls)")
+    sh.kv("Dispositioned calls", tot, "#,##0", bold_val=True)
+    sh.kv("Connected (C-*)", ad["disp_connected"], "#,##0", color=GREEN, bold_val=True)
+    sh.kv("Connected rate", ad["disp_connected_rate"], "0.0%", bold_val=True)
+    sh.blank()
+    dc = ad["disp_counts"]
+    rows = [[idx, int(v), pct(v, tot)] for idx, v in dc.items()]
+    rows.append(["Total", tot, 1.0])
+    sh.section("Full disposition distribution")
+    sh.table(["Disposition", "Calls", "% of dispositioned"], rows,
+             pct_cols=(3,), num_cols=(2,), widths=[28, 14, 18], total_row=True)
+    for title2, series in (("By contact class", ad.get("by_class")),
+                           ("By party", ad.get("by_party")),
+                           ("By outcome", ad.get("by_outcome"))):
+        if series is not None and len(series):
+            rows = [[idx, int(v), pct(v, tot)] for idx, v in series.items()]
+            sh.section(title2)
+            sh.table(["Segment", "Calls", "% of dispositioned"], rows,
+                     pct_cols=(3,), num_cols=(2,), widths=[28, 14, 18])
 
 
 # --------------------------------------------------------------------------- #
@@ -1119,6 +1360,30 @@ def build_workbook(client, period, date_label, ob_res, ib_res, out_path,
                 sh.kv("Worst connect day", f"{wd[0]} — {wd[3]:.1%}", color=RED)
         sh.blank()
 
+        ad = ib_res.get("agentdisp")
+        if ad:
+            sh.section("Inbound — agents & dispositions")
+            sh.kv("Connected (C-*) rate of dispositioned calls",
+                  ad["disp_connected_rate"], "0.0%", color=GREEN, bold_val=True)
+            if ad["agents"]:
+                ranked = [a for a in ad["agents"] if a["handled"] >= 5] or ad["agents"]
+                top = max(ranked, key=lambda a: a["rate"])
+                low = min(ranked, key=lambda a: a["rate"])
+                sh.kv("Top agent (connect rate, ≥5 calls)",
+                      f"{top['agent']} — {top['rate']:.1%} ({top['handled']:,} calls)",
+                      color=GREEN)
+                if low["agent"] != top["agent"]:
+                    sh.kv("Lowest agent (connect rate, ≥5 calls)",
+                          f"{low['agent']} — {low['rate']:.1%} ({low['handled']:,} calls)",
+                          color=RED)
+                sh.kv("Named agents handling calls", ad["n_agents"], "#,##0")
+            if len(ad["disp_counts"]):
+                tc = ad["disp_counts"]
+                sh.kv("Most common disposition",
+                      f"{tc.index[0]} — {int(tc.iloc[0]):,} "
+                      f"({tc.iloc[0] / ad['disp_total']:.0%})")
+            sh.blank()
+
     if alerts is not None:
         write_leadership_alerts(sh, alerts)
 
@@ -1146,6 +1411,9 @@ def build_workbook(client, period, date_label, ob_res, ib_res, out_path,
         if period in ("weekly", "monthly"):
             sh.note("• IB Heatmap — weekday × time-of-day connect-rate grid")
         sh.note("• IB Cost")
+        if ib_res.get("agentdisp"):
+            sh.note("• IB Agents — per-agent connect rate, PTP/payment, talk time (ranked)")
+            sh.note("• IB Dispositions — agent-response breakdown by class / party / outcome")
     sh.blank()
     sh.section("Definitions")
     sh.note("• OB connect = Answered Linkcall (routed to an agent AND picked up). Connect rate = connects ÷ dials.")
@@ -1275,6 +1543,8 @@ def build_workbook(client, period, date_label, ob_res, ib_res, out_path,
         if ib_res.get("total_talk") is not None:
             sh.kv("Total agent talk time (sec)", round(ib_res.get("total_talk", 0), 0), "#,##0")
 
+        write_ib_disposition_tabs(wb, ib_res.get("agentdisp"))
+
         _stream_period_tabs(wb, "IB", ib_res, period, "Connected Calls")
 
     wb.save(out_path)
@@ -1316,6 +1586,19 @@ def client_metrics(client, period, date_label, ob_res, ib_res, drive_link=None,
             "most_missed_window": mb[0] if mb[1] else None,
             "most_missed_count": mb[1],
         }
+        # agent + disposition history (keyed maps -> per-key WoW/MoM trends)
+        ad = ib_res.get("agentdisp")
+        if ad:
+            rec["ib"]["disp_total"] = ad["disp_total"]
+            rec["ib"]["disp_connected"] = ad["disp_connected"]
+            rec["ib"]["disp_connected_rate"] = ad["disp_connected_rate"]
+            rec["ib"]["dispositions"] = {str(k): int(v)
+                                         for k, v in ad["disp_counts"].items()}
+            rec["ib"]["agents"] = {
+                r["agent"]: {"handled": r["handled"], "connected": r["connected"],
+                             "rate": r["rate"], "ptp": r["ptp"],
+                             "payment": r["payment"], "avg_talk": r["avg_talk"]}
+                for r in ad["agents"]}
     return rec
 
 
