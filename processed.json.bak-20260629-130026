@@ -1,0 +1,52 @@
+{
+  "11Mwkkms25rv9LKiTak60Niw7BFyy1JCf::2026-06-25T11:53:35.000Z": {
+    "client": "Prime Recovery",
+    "report": "PrimeRecovery_Daily_2026-06-24_REPORT.xlsx",
+    "processed_at": "2026-06-25T18:38:34.896916"
+  },
+  "1HJWxhH3GuI7kr2xFmwktXfO18X-3imCK::2026-06-25T14:08:21.000Z": {
+    "client": "Prime Recovery",
+    "report": "PrimeRecovery_Daily_2026-06-25_REPORT.xlsx",
+    "processed_at": "2026-06-25T19:39:17.608552"
+  },
+  "15yW7FcJaUxABnsvLaFFfpStHAWEC9zc6::2026-06-25T17:42:06.000Z": {
+    "client": "Auto Finance",
+    "report": "AutoFinance_Daily_2026-06-24_REPORT.xlsx",
+    "processed_at": "2026-06-25T23:12:50.168616"
+  },
+  "1MFajnCDVlRwDd7KikPg_KkQTWYjOCCMM::2026-06-25T17:49:17.000Z": {
+    "client": "Lane Health",
+    "report": "LaneHealth_Daily_2026-06-24_REPORT.xlsx",
+    "processed_at": "2026-06-25T23:20:12.093020"
+  },
+  "1wBjUknwuIQR7U3_6Zn4oDOJ5f4US8yFE::2026-06-29T12:36:30.000Z": {
+    "client": "Lane Health",
+    "report": "LaneHealth_Weekly_2026-06-29_REPORT.xlsx",
+    "processed_at": "2026-06-29T18:09:31.270872"
+  },
+  "1MUHwXcHDA7L_6eiyH-PgwZ3vv3abKttI::2026-06-29T12:37:53.000Z": {
+    "client": "P&R",
+    "report": "P&R_Weekly_2026-06-29_REPORT.xlsx",
+    "processed_at": "2026-06-29T18:09:48.682726"
+  },
+  "1b_ow8dUyt4ROlnd4KSTc78elS4bTS-pT::2026-06-29T12:38:48.000Z": {
+    "client": "Salarly Finance",
+    "report": "SalarlyFinance_Weekly_2026-06-29_REPORT.xlsx",
+    "processed_at": "2026-06-29T18:09:54.840663"
+  },
+  "1YiYImrkvjtkxTwUQd8LGonMb1CjcWRKx::2026-06-29T12:36:06.000Z": {
+    "client": "Auto Finance",
+    "report": "AutoFinance_Weekly_2026-06-29_REPORT.xlsx",
+    "processed_at": "2026-06-29T18:10:03.000058"
+  },
+  "1_HrqzN5YxJuh7U7oLqQL2BDSu9VCWKNH::2026-06-29T12:37:10.000Z": {
+    "client": "My Auto Guard",
+    "report": "MyAutoGuard_Weekly_2026-06-29_REPORT.xlsx",
+    "processed_at": "2026-06-29T18:10:09.691181"
+  },
+  "1sCL6DQ1s58lYk1h9HXuFfBLCXBjTrGb3::2026-06-29T12:38:21.000Z": {
+    "client": "Prime Recovery",
+    "report": "PrimeRecovery_Weekly_2026-06-29_REPORT.xlsx",
+    "processed_at": "2026-06-29T18:10:23.792452"
+  }
+}

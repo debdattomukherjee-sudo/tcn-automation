@@ -107,6 +107,33 @@ def _period_lines(res, period):
     return out
 
 
+def _agent_disp_lines(res, label):
+    """Slack lines for one stream's agent + disposition layer: dispositioned
+    volume, connected (C-*) rate, RPC PTPs + payments, and the top agents ranked
+    by PTP + payment. Empty when the dump carried no disposition column."""
+    ad = res.get("agentdisp") if res else None
+    if not ad or not ad.get("disp_total"):
+        return []
+    by_out = ad.get("by_outcome")
+    ptp = int(by_out.get("PTP", 0)) if by_out is not None else 0
+    pay = int(by_out.get("PAYMENT", 0)) if by_out is not None else 0
+    out = ["",
+           f"🧑‍💼  {label} AGENTS & DISPOSITIONS",
+           f"     {ad['disp_total']:,} dispositioned  ·  "
+           f"{ad['disp_connected_rate']:.1%} connected (C-*)",
+           f"     🤝 RPC PTPs: {ptp:,}  ·  💵 Payments: {pay:,}"]
+    agents = ad.get("agents") or []
+    ranked = sorted(agents, key=lambda a: (a.get("ptp", 0) + a.get("payment", 0)),
+                    reverse=True)
+    top = [a for a in ranked if (a.get("ptp", 0) + a.get("payment", 0)) > 0][:3]
+    if top:
+        out.append("     🏅 Top agents (PTP / payment):")
+        for a in top:
+            out.append(f"        • {a['agent']}: {a['ptp']} PTP / {a['payment']} pay "
+                       f"({a['rate']:.0%} conn, {a['handled']:,} calls)")
+    return out
+
+
 def build_summary(client, period, date_label, ob_res, ib_res, comparisons=None):
     """Clean plain-text summary for Slack. Workflow Builder posts the variable
     as-is and does NOT render mrkdwn, so we avoid *bold* markup and lean on
@@ -140,6 +167,7 @@ def build_summary(client, period, date_label, ob_res, ib_res, comparisons=None):
         if ob_res.get("total_cost") is not None:
             lines.append(f"     💰 ${ob_res['total_cost']:,.2f} total  ·  "
                          f"${ob_res.get('cost_per_al', 0):,.3f} / linkcall")
+        lines += _agent_disp_lines(ob_res, "OB")
     if ib_res:
         be, ne, pe = tcn_report.best_bucket(ib_res["est_conn"])
         lines.append("")
@@ -155,6 +183,7 @@ def build_summary(client, period, date_label, ob_res, ib_res, comparisons=None):
         if mb[1]:
             lines.append(f"     🚨 Most-missed window (EST): {mb[0]} ({mb[1]} missed)")
         lines += _period_lines(ib_res, period)
+        lines += _agent_disp_lines(ib_res, "IB")
     return "\n".join(lines)
 
 
@@ -314,6 +343,25 @@ def build_rollup_summary(records, period, date_label, movement=None):
             b = r["ib"]
             lines.append(f"     • {r['client']}: {b['miss_rate']:.1%} missed "
                          f"({b['missed']:,}/{b['calls']:,})")
+
+    # Client-wise PTPs & payments (across OB + IB dispositioned calls).
+    def _client_ptp(r):
+        ptp = pay = 0
+        for stream in ("ob", "ib"):
+            s = r.get(stream) or {}
+            for a in (s.get("agents") or {}).values():
+                ptp += a.get("ptp", 0)
+                pay += a.get("payment", 0)
+        return ptp, pay
+    ptp_rows = [(r["client"], *_client_ptp(r)) for r in records]
+    ptp_rows = [x for x in ptp_rows if x[1] or x[2]]
+    if ptp_rows:
+        tot_ptp = sum(x[1] for x in ptp_rows)
+        tot_pay = sum(x[2] for x in ptp_rows)
+        lines.append("")
+        lines.append(f"🤝  PTPs & payments by client  (total {tot_ptp:,} PTP · {tot_pay:,} pay)")
+        for c, ptp, pay in sorted(ptp_rows, key=lambda x: -(x[1] + x[2])):
+            lines.append(f"     • {c}: {ptp:,} PTP · {pay:,} pay")
     return "\n".join(lines)
 
 
