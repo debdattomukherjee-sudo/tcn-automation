@@ -114,9 +114,10 @@ def _agent_disp_lines(res, label):
     ad = res.get("agentdisp") if res else None
     if not ad or not ad.get("disp_total"):
         return []
-    by_out = ad.get("by_outcome")
-    ptp = int(by_out.get("PTP", 0)) if by_out is not None else 0
-    pay = int(by_out.get("PAYMENT", 0)) if by_out is not None else 0
+    # Use the engine's canonical totals (taxonomy-aware) rather than matching
+    # outcome token strings, which vary (e.g. PAYMENT_ON_CALL, not PAYMENT).
+    ptp = int(ad.get("ptp_total", 0))
+    pay = int(ad.get("payment_total", 0))
     out = ["",
            f"🧑‍💼  {label} AGENTS & DISPOSITIONS",
            f"     {ad['disp_total']:,} dispositioned  ·  "

@@ -98,6 +98,24 @@ AGENT_BLANK_LABEL = "System / Unassigned"
 DISP_CLASS = {"C": "Connected", "NC": "Not Connected"}
 DISP_PARTY = {"RPC": "Right Party (RPC)", "TPC": "Third Party (TPC)"}
 
+# Canonical outcome buckets. Outcome tokens come from parse_disposition (the
+# part after the class/party segments), e.g. "PAYMENT_ON_CALL", "PTP", "NO_PTP".
+# Confirmed taxonomy: a Payment is ONLY a payment taken on the call; an already-
+# paid call is not counted as a new payment. PTP is the literal PTP outcome only
+# (NO_PTP is explicitly NOT a PTP). Everything else stays "connected, not
+# PTP/payment". Sets make adding future codes a one-line change.
+PAYMENT_OUTCOMES = {"PAYMENT_ON_CALL"}
+PTP_OUTCOMES = {"PTP"}
+NO_PTP_OUTCOMES = {"NO_PTP"}
+
+
+def is_payment_outcome(outcome):
+    return outcome in PAYMENT_OUTCOMES
+
+
+def is_ptp_outcome(outcome):
+    return outcome in PTP_OUTCOMES
+
 
 def parse_disposition(code):
     """Split an agent-response code into (class, party, outcome) labels.
@@ -510,6 +528,9 @@ def analyze_ib_agents(ib, m):
     def _counts(col):
         return d[col].dropna().value_counts()
 
+    ptp_total = int(d["outcome"].isin(PTP_OUTCOMES).sum())
+    payment_total = int(d["outcome"].isin(PAYMENT_OUTCOMES).sum())
+    no_ptp_total = int(d["outcome"].isin(NO_PTP_OUTCOMES).sum())
     res = {
         "disp_total": disp_total,
         "disp_counts": disp_counts,
@@ -518,6 +539,9 @@ def analyze_ib_agents(ib, m):
         "by_class": _counts("cls"),
         "by_party": _counts("party"),
         "by_outcome": _counts("outcome"),
+        "ptp_total": ptp_total,
+        "payment_total": payment_total,
+        "no_ptp_total": no_ptp_total,
     }
 
     # ---- per-agent table (exclude the blank/system bucket from ranking) ----
@@ -526,9 +550,9 @@ def analyze_ib_agents(ib, m):
         handled = int(len(g))
         conn = int((g["connected"] == True).sum())  # noqa: E712
         out = g["outcome"]
-        ptp = int((out == "PTP").sum())
-        payment = int((out == "PAYMENT").sum())
-        no_ptp = int((out == "NO_PTP").sum())
+        ptp = int(out.isin(PTP_OUTCOMES).sum())
+        payment = int(out.isin(PAYMENT_OUTCOMES).sum())
+        no_ptp = int(out.isin(NO_PTP_OUTCOMES).sum())
         tk = pd.to_numeric(g["talk"], errors="coerce").dropna()
         top = g["raw"].value_counts()
         agent_rows.append({
@@ -1325,10 +1349,13 @@ def write_ib_disposition_tabs(wb, ad, raw, talk_h=None, prefix="IB", label="Inbo
             handled = raw.countifs([(H_AGENT, a), (H_HASDISP, _q("Yes"))])
             conn = raw.countifs([(H_AGENT, a), (H_HASDISP, _q("Yes")),
                                  (H_DISP_CONN, _q("Yes"))])
-            ptp = raw.countifs([(H_AGENT, a), (H_HASDISP, _q("Yes")),
-                                (H_DISP_OUTCOME, _q("PTP"))])
-            pay = raw.countifs([(H_AGENT, a), (H_HASDISP, _q("Yes")),
-                                (H_DISP_OUTCOME, _q("PAYMENT"))])
+            # PTP / payment are summed over the canonical outcome sets so the
+            # live formula matches the taxonomy (e.g. PAYMENT_ON_CALL, not the
+            # bare token "PAYMENT") and still works if a set gains more codes.
+            ptp = "+".join(raw.countifs([(H_AGENT, a), (H_HASDISP, _q("Yes")),
+                           (H_DISP_OUTCOME, _q(o))]) for o in sorted(PTP_OUTCOMES))
+            pay = "+".join(raw.countifs([(H_AGENT, a), (H_HASDISP, _q("Yes")),
+                           (H_DISP_OUTCOME, _q(o))]) for o in sorted(PAYMENT_OUTCOMES))
             row = [r["agent"], EQ(handled), EQ(conn),
                    EQ(IFERR(f"C{er}/B{er}", "0")), EQ(ptp), EQ(pay)]
             # avg talk = AVERAGEIFS over the dump's talk column if present
