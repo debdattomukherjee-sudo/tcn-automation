@@ -42,10 +42,27 @@ def save_state(state):
         json.dump(state, fh, indent=2)
 
 
-def is_raw_input(name):
-    return (name.lower().endswith((".xlsx", ".xls"))
-            and config.REPORT_TAG.lower() not in name.lower()
-            and not name.startswith("~$"))
+def is_raw_input(name, mime=None):
+    """A file counts as a raw OB/IB input if it's either a real .xlsx/.xls
+    upload OR a native Google Sheet (which we export to xlsx on download).
+    Generated reports (REPORT_TAG) and Office temp files (~$) are excluded.
+    Native Sheets are uploaded by us only as xlsx, so a Sheet is always raw."""
+    if name.startswith("~$") or config.REPORT_TAG.lower() in name.lower():
+        return False
+    if mime == drive_sync.GSHEET_MIME:
+        return True
+    return name.lower().endswith((".xlsx", ".xls"))
+
+
+def input_base_name(name):
+    """Filename minus a trailing .xlsx/.xls only. Native Sheet names have no
+    extension (and may legitimately contain dots like '6.29'), so we must NOT
+    naively split on the last dot."""
+    low = name.lower()
+    for ext in (".xlsx", ".xls"):
+        if low.endswith(ext):
+            return name[: -len(ext)]
+    return name
 
 
 def period_bounds(ob, ib):
@@ -196,7 +213,11 @@ def process_file(service, client, folder_id, fobj, state, hist):
 
     print(f"[{client}] New file detected: {name}")
     os.makedirs(config.WORK_DIR, exist_ok=True)
-    local_in = os.path.join(config.WORK_DIR, name)
+    base = input_base_name(name)
+    # Always land the downloaded/exported bytes as a real .xlsx so pandas picks
+    # the openpyxl engine regardless of the source name (native Sheets carry no
+    # extension; download_xlsx exports them to xlsx).
+    local_in = os.path.join(config.WORK_DIR, base + ".xlsx")
     drive_sync.download_xlsx(service, fobj, local_in)
 
     _, file_period, file_date = tcn_report.parse_filename(name)
@@ -220,7 +241,7 @@ def process_file(service, client, folder_id, fobj, state, hist):
     comparisons = trends.compute_comparisons(rec, hist)
     client_alerts = alerts.evaluate(rec, comparisons, hist)
 
-    out_name = name.rsplit(".", 1)[0] + config.REPORT_TAG + ".xlsx"
+    out_name = base + config.REPORT_TAG + ".xlsx"
     local_out = os.path.join(config.WORK_DIR, out_name)
     tcn_report.build_workbook(client, period, date_label, ob_res, ib_res, local_out,
                               comparisons=comparisons, alerts=client_alerts)
@@ -260,7 +281,7 @@ def process_client(service, client, folder_id, state, hist):
     records produced this run (one per newly-built report) for the roll-up."""
     records = []
     for fobj in drive_sync.list_files(service, folder_id):
-        if not is_raw_input(fobj["name"]):
+        if not is_raw_input(fobj["name"], fobj.get("mimeType")):
             continue
         try:
             rec = process_file(service, client, folder_id, fobj, state, hist)
